@@ -1,0 +1,85 @@
+# Multi-Stage Dockerfile for Ultra-Low-Bandwidth Telemetry Publisher
+# ==============================================================================
+# Architecture: FRC 2026 REBUILT Automated Video Scouting Pipeline
+# Role: Subscribes to Ray Core analytics output and publishes compressed
+#       Protobuf telemetry (< 50 KB per match sync) over Paho-MQTT v2 to venue tablets.
+# Security: Minimal container footprint running strictly as non-root user 'scout'.
+# Base: python:3.12-slim-bookworm
+# ==============================================================================
+
+# ==============================================================================
+# Stage 1: Build & Python Dependency Wheels
+# ==============================================================================
+FROM python:3.12-slim-bookworm AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Install build dependencies for compiling binary extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Setup virtual environment
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN pip install --upgrade pip setuptools wheel
+
+# Install Paho-MQTT v2, Protobuf, DuckDB, and schema validation packages
+RUN pip install --no-cache-dir \
+    "paho-mqtt==2.1.0" \
+    "protobuf==5.28.3" \
+    "duckdb==1.1.3" \
+    "pyyaml==6.0.2" \
+    "pydantic==2.9.2"
+
+# ==============================================================================
+# Stage 2: Minimal Non-Root Production Runtime
+# ==============================================================================
+FROM python:3.12-slim-bookworm AS runtime
+
+LABEL maintainer="FRC Scouting Architecture Team" \
+      description="Ultra-low-bandwidth telemetry publisher running as non-root scout user"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    MQTT_BROKER_HOST="mosquitto-broker" \
+    MQTT_BROKER_PORT="1883" \
+    MQTT_CLIENT_ID="scout-pub"
+
+# Install minimal certificates for TLS broker connectivity
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-compiled virtual environment from builder stage
+COPY --from=builder /opt/venv /opt/venv
+
+# Security: Create non-root system group and user 'scout'
+RUN groupadd -g 10001 scout && \
+    useradd -u 10001 -g scout -m -s /bin/bash scout
+
+WORKDIR /app
+
+# Copy application artifacts and schemas
+COPY proto /app/proto
+COPY src /app/src
+COPY configs /app/configs
+COPY deploy/docker/entrypoint-publisher.sh /usr/local/bin/entrypoint-publisher.sh
+
+RUN chmod +x /usr/local/bin/entrypoint-publisher.sh && \
+    chown -R scout:scout /app
+
+# Enforce least-privilege non-root execution
+USER scout
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-publisher.sh"]
+CMD ["python", "-m", "src.transport.mqtt_publisher"]

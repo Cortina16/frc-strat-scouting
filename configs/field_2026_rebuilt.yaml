@@ -1,0 +1,96 @@
+# FRC 2026 REBUILT Field Topology and Ground-Truth Geometry
+# Units: inches and degrees (origin at bottom-left corner of field carpet)
+
+field:
+  name: "FRC 2026 REBUILT"
+  length_inches: 651.2
+  width_inches: 317.7
+  guardrail_height_inches: 20.0
+  carpet_thickness_inches: 0.125
+
+elements:
+  red_hub:
+    center: [162.8, 158.85]
+    size: [47.0, 47.0]
+    opening_hex_diameter_inches: 41.7
+    elevation_inches: 72.0
+  blue_hub:
+    center: [488.4, 158.85]
+    size: [47.0, 47.0]
+    opening_hex_diameter_inches: 41.7
+    elevation_inches: 72.0
+  towers:
+    red:
+      base_center: [90.0, 158.85]
+      rung_elevation_inches: 65.0
+    blue:
+      base_center: [561.2, 158.85]
+      rung_elevation_inches: 65.0
+  depots:
+    - name: "depot_north"
+      center: [325.6, 280.0]
+      size: [36.0, 24.0]
+    - name: "depot_south"
+      center: [325.6, 37.7]
+      size: [36.0, 24.0]
+  bumps:
+    - [280.0, 80.0, 30.0, 10.0]
+    - [280.0, 237.7, 30.0, 10.0]
+    - [371.2, 80.0, 30.0, 10.0]
+    - [371.2, 237.7, 30.0, 10.0]
+  trenches:
+    - [270.0, 15.0, 110.0, 40.0]
+    - [270.0, 262.7, 110.0, 40.0]
+
+robots:
+  max_perimeter_inches: 110.0
+  max_extension_horizontal_inches: 12.0
+  max_height_vertical_inches: 30.0
+  bumper_height_min_inches: 1.0
+  bumper_height_max_inches: 7.0
+
+# 32 Unique AprilTag Fiducials (Family: tag36h11, Size: 8.125 inches)
+apriltags:
+  family: "tag36h11"
+  size_inches: 8.125
+  tags:
+    # Red Alliance Wall & Outpost
+    - { id: 1,  x: 0.0,   y: 100.0, z: 58.5, roll: 0.0, pitch: 0.0, yaw: 0.0 }
+    - { id: 2,  x: 0.0,   y: 158.85, z: 58.5, roll: 0.0, pitch: 0.0, yaw: 0.0 }
+    - { id: 3,  x: 0.0,   y: 217.7, z: 58.5, roll: 0.0, pitch: 0.0, yaw: 0.0 }
+    - { id: 4,  x: 40.0,  y: 317.7, z: 45.0, roll: 0.0, pitch: 0.0, yaw: 270.0 }
+    # Red Hub (4 faces)
+    - { id: 5,  x: 139.3, y: 158.85, z: 62.0, roll: 0.0, pitch: 0.0, yaw: 0.0 }
+    - { id: 6,  x: 162.8, y: 182.35, z: 62.0, roll: 0.0, pitch: 0.0, yaw: 270.0 }
+    - { id: 7,  x: 186.3, y: 158.85, z: 62.0, roll: 0.0, pitch: 0.0, yaw: 180.0 }
+    - { id: 8,  x: 162.8, y: 135.35, z: 62.0, roll: 0.0, pitch: 0.0, yaw: 90.0 }
+    # Red Tower
+    - { id: 9,  x: 90.0,  y: 140.0, z: 70.0, roll: 0.0, pitch: 0.0, yaw: 90.0 }
+    - { id: 10, x: 90.0,  y: 177.7, z: 70.0, roll: 0.0, pitch: 0.0, yaw: 270.0 }
+    # Neutral Zone & Guardrails
+    - { id: 11, x: 250.0, y: 0.0,   z: 18.0, roll: 0.0, pitch: 0.0, yaw: 90.0 }
+    - { id: 12, x: 325.6, y: 0.0,   z: 18.0, roll: 0.0, pitch: 0.0, yaw: 90.0 }
+    - { id: 13, x: 400.0, y: 0.0,   z: 18.0, roll: 0.0, pitch: 0.0, yaw: 90.0 }
+    - { id: 14, x: 250.0, y: 317.7, z: 18.0, roll: 0.0, pitch: 0.0, yaw: 270.0 }
+    - { id: 15, x: 325.6, y: 317.7, z: 18.0, roll: 0.0, pitch: 0.0, yaw: 270.0 }
+    - { id: 16, x: 400.0, y: 317.7, z: 18.0, roll: 0.0, pitch: 0.0, yaw: 270.0 }
+    # Blue Hub (4 faces)
+    - { id: 17, x: 464.9, y: 158.85, z: 62.0, roll: 0.0, pitch: 0.0, yaw: 0.0 }
+    - { id: 18, x: 488.4, y: 182.35, z: 62.0, roll: 0.0, pitch: 0.0, yaw: 270.0 }
+    - { id: 19, x: 511.9, y: 158.85, z: 62.0, roll: 0.0, pitch: 0.0, yaw: 180.0 }
+    - { id: 20, x: 488.4, y: 135.35, z: 62.0, roll: 0.0, pitch: 0.0, yaw: 90.0 }
+    # Blue Tower
+    - { id: 21, x: 561.2, y: 140.0, z: 70.0, roll: 0.0, pitch: 0.0, yaw: 90.0 }
+    - { id: 22, x: 561.2, y: 177.7, z: 70.0, roll: 0.0, pitch: 0.0, yaw: 270.0 }
+    # Blue Alliance Wall & Outpost
+    - { id: 23, x: 651.2, y: 100.0, z: 58.5, roll: 0.0, pitch: 0.0, yaw: 180.0 }
+    - { id: 24, x: 651.2, y: 158.85, z: 58.5, roll: 0.0, pitch: 0.0, yaw: 180.0 }
+    - { id: 25, x: 651.2, y: 217.7, z: 58.5, roll: 0.0, pitch: 0.0, yaw: 180.0 }
+    - { id: 26, x: 611.2, y: 317.7, z: 45.0, roll: 0.0, pitch: 0.0, yaw: 270.0 }
+    # Depots & Perimeter Markers
+    - { id: 27, x: 307.6, y: 280.0, z: 30.0, roll: 0.0, pitch: 0.0, yaw: 180.0 }
+    - { id: 28, x: 343.6, y: 280.0, z: 30.0, roll: 0.0, pitch: 0.0, yaw: 0.0 }
+    - { id: 29, x: 307.6, y: 37.7,  z: 30.0, roll: 0.0, pitch: 0.0, yaw: 180.0 }
+    - { id: 30, x: 343.6, y: 37.7,  z: 30.0, roll: 0.0, pitch: 0.0, yaw: 0.0 }
+    - { id: 31, x: 100.0, y: 0.0,   z: 20.0, roll: 0.0, pitch: 0.0, yaw: 90.0 }
+    - { id: 32, x: 551.2, y: 0.0,   z: 20.0, roll: 0.0, pitch: 0.0, yaw: 90.0 }

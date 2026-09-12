@@ -1,0 +1,172 @@
+# ==============================================================================
+# FRC 2026 REBUILT: Production Eclipse Mosquitto MQTT Broker Manifest
+# ==============================================================================
+# Components:
+# 1. ConfigMap: Mosquitto broker configuration with persistence, 64 KB max packet
+#    size ceiling (< 50 KB telemetry budget), listeners 1883, 8883, 9001 (WS).
+# 2. PersistentVolumeClaim: Durable storage for retain messages and queue states.
+# 3. Deployment: Mosquitto broker container with tcpSocket health probes on port 1883.
+# 4. Service: LoadBalancer/ClusterIP exposing ports 1883, 8883, and 9001 for in-venue tablets.
+# ==============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mosquitto-config
+  namespace: default
+  labels:
+    app.kubernetes.io/name: mosquitto
+    app.kubernetes.io/component: mqtt-broker
+    app.kubernetes.io/part-of: frc-scouting
+data:
+  mosquitto.conf: |
+    # ==============================================================================
+    # Eclipse Mosquitto 2.0+ Supercluster Broker Configuration
+    # ==============================================================================
+    # Persistence Configuration
+    persistence true
+    persistence_location /mosquitto/data/
+    autosave_interval 300
+    autosave_on_changes false
+
+    # Logging Configuration
+    log_dest stdout
+    log_type error
+    log_type warning
+    log_type notice
+    log_type information
+    connection_messages true
+    log_timestamp true
+
+    # Guardrails: 64 KB Max Packet Size Ceiling (enforces < 50 KB telemetry limit)
+    max_packet_size 65536
+    max_connections 2048
+    max_queued_messages 10000
+    max_inflight_messages 100
+
+    # Listener 1: Plaintext TCP for cluster-internal actors & in-venue tablet clients
+    listener 1883 0.0.0.0
+    allow_anonymous true
+
+    # Listener 2: TLS Protected Transport
+    listener 8883 0.0.0.0
+
+    # Listener 3: WebSockets for venue live visualizer web clients
+    listener 9001 0.0.0.0
+    protocol websockets
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mosquitto-data-pvc
+  namespace: default
+  labels:
+    app.kubernetes.io/name: mosquitto
+    app.kubernetes.io/component: mqtt-broker
+    app.kubernetes.io/part-of: frc-scouting
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mosquitto-broker
+  namespace: default
+  labels:
+    app.kubernetes.io/name: mosquitto
+    app.kubernetes.io/component: mqtt-broker
+    app.kubernetes.io/part-of: frc-scouting
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mosquitto
+      app.kubernetes.io/component: mqtt-broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mosquitto
+        app.kubernetes.io/component: mqtt-broker
+    spec:
+      containers:
+        - name: mosquitto
+          image: eclipse-mosquitto:2.0.18
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          ports:
+            - name: mqtt
+              containerPort: 1883
+              protocol: TCP
+            - name: mqtt-tls
+              containerPort: 8883
+              protocol: TCP
+            - name: websockets
+              containerPort: 9001
+              protocol: TCP
+          livenessProbe:
+            tcpSocket:
+              port: 1883
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 1883
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          volumeMounts:
+            - name: mosquitto-config-vol
+              mountPath: /mosquitto/config/mosquitto.conf
+              subPath: mosquitto.conf
+            - name: mosquitto-data-vol
+              mountPath: /mosquitto/data
+      volumes:
+        - name: mosquitto-config-vol
+          configMap:
+            name: mosquitto-config
+        - name: mosquitto-data-vol
+          persistentVolumeClaim:
+            claimName: mosquitto-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mosquitto-broker
+  namespace: default
+  labels:
+    app.kubernetes.io/name: mosquitto
+    app.kubernetes.io/component: mqtt-broker
+    app.kubernetes.io/part-of: frc-scouting
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: mosquitto
+    app.kubernetes.io/component: mqtt-broker
+  ports:
+    - name: mqtt
+      port: 1883
+      targetPort: 1883
+      protocol: TCP
+    - name: mqtt-tls
+      port: 8883
+      targetPort: 8883
+      protocol: TCP
+    - name: websockets
+      port: 9001
+      targetPort: 9001
+      protocol: TCP

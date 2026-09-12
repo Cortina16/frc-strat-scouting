@@ -1,0 +1,311 @@
+syntax = "proto3";
+
+package frc.scouting.telemetry.v1;
+
+// ============================================================================
+// Enums
+// ============================================================================
+
+enum AllianceColor {
+  ALLIANCE_UNSPECIFIED = 0;
+  ALLIANCE_RED = 1;
+  ALLIANCE_BLUE = 2;
+}
+
+enum AllianceStation {
+  STATION_UNSPECIFIED = 0;
+  STATION_1 = 1;
+  STATION_2 = 2;
+  STATION_3 = 3;
+}
+
+enum MatchStage {
+  STAGE_UNSPECIFIED = 0;
+  STAGE_PRE_MATCH = 1;
+  STAGE_AUTONOMOUS = 2;
+  STAGE_TELEOP = 3;
+  STAGE_ENDGAME = 4;
+  STAGE_POST_MATCH = 5;
+}
+
+enum TrackState {
+  TRACK_STATE_UNSPECIFIED = 0;
+  TRACK_STATE_TRACKED = 1;      // Actively tracked in current frame
+  TRACK_STATE_LOST = 2;         // Temporarily occluded (behind Hub, Tower, Bump)
+  TRACK_STATE_BRIDGED = 3;      // Re-associated post-camera cut via ReID embedding
+  TRACK_STATE_REMOVED = 4;      // Track terminated
+}
+
+enum OcclusionStatus {
+  OCCLUSION_NONE = 0;
+  OCCLUSION_PARTIAL = 1;        // Partial line-of-sight obstruction
+  OCCLUSION_FULL = 2;           // Complete obstruction behind field element
+}
+
+enum ActionType {
+  ACTION_UNSPECIFIED = 0;
+  ACTION_INTAKE_FUEL = 1;               // Fuel ingestion from Depot or carpet
+  ACTION_SCORE_HUB = 2;                 // Delivering Fuel into 72-inch hexagonal Hub
+  ACTION_CLIMB_TOWER = 3;               // Tower ascent / hang
+  ACTION_DEFENSIVE_ENGAGEMENT = 4;      // Physical defense / pinning / blocking
+  ACTION_TRANSIT_NEUTRAL_ZONE = 5;      // High-speed transit across Bumps / Trenches
+  ACTION_OUTPOST_CORRAL_CYCLE = 6;      // Interaction at Alliance Outpost / Corral
+  ACTION_IDLE = 7;
+}
+
+enum FieldElement {
+  ELEMENT_UNSPECIFIED = 0;
+  ELEMENT_RED_HUB = 1;
+  ELEMENT_BLUE_HUB = 2;
+  ELEMENT_RED_TOWER = 3;
+  ELEMENT_BLUE_TOWER = 4;
+  ELEMENT_RED_OUTPOST = 5;
+  ELEMENT_BLUE_OUTPOST = 6;
+  ELEMENT_RED_CORRAL = 7;
+  ELEMENT_BLUE_CORRAL = 8;
+  ELEMENT_DEPOT = 9;
+  ELEMENT_BUMP = 10;
+  ELEMENT_TRENCH = 11;
+  ELEMENT_NEUTRAL_ZONE = 12;
+}
+
+enum ReconciliationStatus {
+  RECON_STATUS_UNSPECIFIED = 0;
+  RECON_STATUS_PENDING = 1;             // Awaiting FRC Field API score confirmation
+  RECON_STATUS_CONFIRMED = 2;           // Validated by Bayesian spatial-temporal engine
+  RECON_STATUS_PRUNED_FALSE_POSITIVE = 3;// Rejected due to spatial inconsistency or score cap
+  RECON_STATUS_ADJUSTED = 4;            // Calibrated against ground-truth delta
+}
+
+// ============================================================================
+// Core Geometry & Mathematical Types
+// ============================================================================
+
+message Point2D {
+  float x = 1;
+  float y = 2;
+}
+
+message Vector2D {
+  float vx = 1;
+  float vy = 2;
+}
+
+message BoundingBox2D {
+  float center_x = 1;
+  float center_y = 2;
+  float width = 3;
+  float height = 4;
+  float confidence = 5;
+}
+
+// Row-major 3x3 planar transformation matrix mapping pixel (u,v,1)^T -> field (x,y,1)^T
+message HomographyMatrix {
+  repeated double elements = 1; // Exactly 9 doubles in row-major order: h11, h12, ..., h33
+}
+
+// Row-major 2x3 affine matrix for Camera Motion Compensation (CMC)
+message AffineTransform2D {
+  repeated double elements = 1; // Exactly 6 doubles: [a11, a12, tx, a21, a22, ty]
+}
+
+// ============================================================================
+// AprilTag & Dynamic Homography Data
+// ============================================================================
+
+message AprilTagDetection {
+  int32 tag_id = 1;                   // Tag ID (1 to 32 on REBUILT field)
+  repeated Point2D image_corners = 2; // 4 corners in pixel coordinates [top-left, top-right, bottom-right, bottom-left]
+  Point2D field_position = 3;         // CAD ground truth (x, y) coordinates in inches
+  double field_elevation_z = 4;       // Z height of tag in inches
+  float reprojection_error = 5;       // Per-tag reprojection residual (pixels)
+  int32 hamming_distance = 6;         // Bit-error distance during decoding
+}
+
+message HomographyTelemetry {
+  int64 frame_index = 1;
+  int64 timestamp_ms = 2;
+  HomographyMatrix homography = 3;
+  AffineTransform2D cmc_affine = 4;
+
+  repeated AprilTagDetection detected_tags = 5;
+  int32 num_tags_detected = 6;
+
+  // Optimization & Stability Metrics
+  double dlt_condition_number = 7;
+  double lm_reprojection_rmse = 8;    // Levenberg-Marquardt residual RMSE in pixels
+  int32 lm_iterations = 9;
+  bool optimization_converged = 10;
+  bool camera_cut_detected = 11;      // Flag set when scene cut / broadcast switch occurs
+  float camera_zoom_factor = 12;
+}
+
+// ============================================================================
+// Multi-Object Tracking & Robot Match Trajectories
+// ============================================================================
+
+message RobotTelemetryPoint {
+  int32 track_id = 1;                 // BoT-SORT assigned persistent tracker ID
+  int32 team_number = 2;              // Team number resolved by Super-Res OCR
+  AllianceColor alliance = 3;
+  AllianceStation station = 4;
+
+  // Physical 2D Field Coordinates (Field boundary: 317.7 in x 651.2 in)
+  Point2D field_position = 5;         // Position (x, y) in inches
+  float heading_rad = 6;              // Heading angle relative to field reference
+  Vector2D velocity = 7;              // Linear velocity (vx, vy) in inches/second
+  float angular_velocity_rad_s = 8;   // Angular velocity in rad/second
+
+  // Perceived Bounding Box & Tracking State
+  BoundingBox2D bbox = 9;             // Image plane box [xc, yc, w, h]
+  TrackState track_state = 10;
+  OcclusionStatus occlusion = 11;
+  float ocr_confidence = 12;
+  bool ocr_super_resolved = 13;       // True if Real-ESRGAN super-resolution was applied
+
+  // Optional appearance ReID feature vector for post-cut tracklet bridging
+  bytes reid_embedding = 14;
+}
+
+message TrajectoryFrame {
+  int64 frame_index = 1;
+  int64 match_time_ms = 2;            // Elapsed milliseconds since match start
+  float match_remaining_seconds = 3;
+  MatchStage match_stage = 4;
+
+  repeated RobotTelemetryPoint robots = 5; // Up to 6 robots per match
+}
+
+message MatchTrajectoryBatch {
+  string event_key = 1;               // e.g. "2026casf"
+  string match_id = 2;                // e.g. "qm42"
+  repeated TrajectoryFrame frames = 3;
+}
+
+// ============================================================================
+// ActionFormer Metadata & Temporal Action Localization
+// ============================================================================
+
+message ActionFormerEvent {
+  string event_id = 1;                // UUID for action event
+  int32 track_id = 2;
+  int32 team_number = 3;
+  AllianceColor alliance = 4;
+
+  ActionType action_type = 5;
+  FieldElement primary_element = 6;
+
+  // Temporal Boundary Regression (onset and offset)
+  int64 start_time_ms = 7;
+  int64 end_time_ms = 8;
+  int64 start_frame = 9;
+  int64 end_frame = 10;
+  float duration_seconds = 11;
+
+  // Network Confidences & Scale
+  float raw_confidence = 12;          // Focal Loss calibrated probability
+  float boundary_diou = 13;           // Distance-IoU boundary uncertainty metric
+  int32 feature_pyramid_level = 14;   // 0 (fine-grained) to L (coarse prolonged)
+
+  // Spatial Anchor
+  Point2D field_position_at_onset = 15;
+  Point2D field_position_at_offset = 16;
+
+  // Bayesian Reconciliation Layer
+  ReconciliationStatus reconciliation = 17;
+  float reconciled_posterior = 18;    // Bayesian posterior probability
+  int32 reconciled_fuel_delta = 19;   // Verified fuel processed
+  string reconciliation_notes = 20;
+}
+
+message ActionMetadataBatch {
+  string event_key = 1;
+  string match_id = 2;
+  repeated ActionFormerEvent actions = 3;
+}
+
+// ============================================================================
+// DuckDB Client Sync Messages (<50 KB Budget over MQTT)
+// ============================================================================
+
+message RobotMatchAggregate {
+  int32 team_number = 1;
+  AllianceColor alliance = 2;
+
+  // Scoring & Cycle Metrics
+  int32 total_fuel_scored = 3;
+  int32 total_cycles = 4;
+  float avg_cycle_time_seconds = 5;
+  float min_cycle_time_seconds = 6;
+  float avg_neutral_zone_transit_time_s = 7;
+
+  // Physical & Spatial Metrics
+  float total_distance_traveled_inches = 8;
+  float max_velocity_inches_s = 9;
+  float avg_velocity_inches_s = 10;
+  float time_under_defensive_pressure_s = 11;
+
+  // Endgame
+  bool tower_climb_success = 12;
+  float tower_climb_duration_s = 13;
+}
+
+message ZoneTransitStatistic {
+  int32 team_number = 1;
+  string origin_zone = 2;            // e.g. "HUMAN_STARTING_LINE"
+  string destination_zone = 3;       // e.g. "ALLIANCE_HUB"
+  string transit_corridor = 4;       // e.g. "TRENCH_WEST" or "BUMP_NORTH"
+  float avg_transit_seconds = 5;
+  int32 sample_count = 6;
+  float defensive_impedance_ratio = 7; // degradation multiplier under defense
+}
+
+message DuckDBSyncPayload {
+  enum PayloadType {
+    PAYLOAD_TYPE_UNSPECIFIED = 0;
+    PAYLOAD_DELTA_SUMMARY = 1;        // Compact structured delta for instant tablet UI
+    PAYLOAD_COLUMNAR_PARQUET = 2;     // Compressed Parquet/Arrow bytes
+    PAYLOAD_FULL_SNAPSHOT = 3;        // Authoritative end-of-match sync
+  }
+
+  string event_key = 1;
+  string match_id = 2;
+  int64 sequence_number = 3;
+  int64 generated_at_epoch_ms = 4;
+  PayloadType payload_type = 5;
+
+  // Compact Aggregates (Fits comfortably under 50KB constraint)
+  repeated RobotMatchAggregate robot_aggregates = 6;
+  repeated ZoneTransitStatistic zone_transits = 7;
+  repeated ActionFormerEvent verified_scoring_events = 8;
+
+  // Optional compressed Parquet columnar chunk (if payload_type == PAYLOAD_COLUMNAR_PARQUET)
+  bytes compressed_parquet_chunk = 9;
+  string parquet_table_name = 10;
+
+  // Ground Truth Alignment Record
+  int32 frc_api_red_score = 11;
+  int32 frc_api_blue_score = 12;
+  int32 vision_reconciled_red_score = 13;
+  int32 vision_reconciled_blue_score = 14;
+  bool fully_reconciled = 15;
+}
+
+// ============================================================================
+// Top-Level Telemetry Envelope (Transport Carrier)
+// ============================================================================
+
+message TelemetryEnvelope {
+  string message_id = 1;              // UUID
+  int64 epoch_timestamp_ms = 2;
+  int32 schema_version = 3;           // e.g. 1
+
+  oneof payload {
+    HomographyTelemetry homography = 10;
+    TrajectoryFrame trajectory_frame = 11;
+    MatchTrajectoryBatch trajectory_batch = 12;
+    ActionFormerEvent action_event = 13;
+    ActionMetadataBatch action_batch = 14;
+    DuckDBSyncPayload duckdb_sync = 15;
+  }
+}

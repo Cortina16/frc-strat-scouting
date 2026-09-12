@@ -1,0 +1,137 @@
+# ==============================================================================
+# FRC 2026 REBUILT: KubeRay Production Supercluster Manifest
+# ==============================================================================
+# Deploys a distributed RayCluster (apiVersion: ray.io/v1) configured for:
+# - Head Node: 4-8 CPUs, 16-32 GiB RAM, GCS (6379), Dashboard (8265), Client (10001)
+# - CPU Workers: Replicas for video decoding (FFmpeg/PyAV), AprilTag homography (DLT/LM),
+#   and Kalman filtering / Bayesian reconciliation
+# - GPU Workers (RTX 4090): Replicas with nvidia.com/gpu: 1 for TensorRT YOLOv11 and Real-ESRGAN
+# - Zero-Copy IPC: High-throughput /dev/shm volume mounts (emptyDir medium: Memory)
+# ==============================================================================
+
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ray-supercluster
+  namespace: default
+  labels:
+    app.kubernetes.io/name: kuberay
+    app.kubernetes.io/component: ray-cluster
+    app.kubernetes.io/part-of: frc-scouting
+spec:
+  rayVersion: '2.38.0'
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: '0.0.0.0'
+      block: 'true'
+      num-cpus: '0'
+    template:
+      metadata:
+        labels:
+          ray.io/node-type: head
+          app.kubernetes.io/component: ray-head
+      spec:
+        containers:
+          - name: ray-head
+            image: frc-scouting/ray-worker:latest
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                cpu: "4"
+                memory: "16Gi"
+              limits:
+                cpu: "8"
+                memory: "32Gi"
+            ports:
+              - name: gcs
+                containerPort: 6379
+                protocol: TCP
+              - name: dashboard
+                containerPort: 8265
+                protocol: TCP
+              - name: client
+                containerPort: 10001
+                protocol: TCP
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+  workerGroupSpecs:
+    # CPU-bound worker group: Video decoding, AprilTag homography, Kalman filtering
+    - groupName: cpu-workers
+      replicas: 4
+      minReplicas: 2
+      maxReplicas: 8
+      rayStartParams:
+        block: 'true'
+      template:
+        metadata:
+          labels:
+            ray.io/node-type: worker
+            ray.io/group: cpu-workers
+            app.kubernetes.io/component: cpu-worker
+        spec:
+          containers:
+            - name: ray-worker-cpu
+              image: frc-scouting/ray-worker:latest
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  cpu: "4"
+                  memory: "8Gi"
+                limits:
+                  cpu: "8"
+                  memory: "16Gi"
+              volumeMounts:
+                - mountPath: /dev/shm
+                  name: dshm
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 8Gi
+    # GPU-bound worker group: TensorRT YOLOv11 & Real-ESRGAN OCR on NVIDIA RTX 4090
+    - groupName: gpu-workers-rtx4090
+      replicas: 2
+      minReplicas: 1
+      maxReplicas: 4
+      rayStartParams:
+        block: 'true'
+      template:
+        metadata:
+          labels:
+            ray.io/node-type: worker
+            ray.io/group: gpu-workers-rtx4090
+            app.kubernetes.io/component: gpu-worker
+        spec:
+          nodeSelector:
+            accelerator: nvidia-rtx-4090
+          tolerations:
+            - key: "nvidia.com/gpu"
+              operator: "Exists"
+              effect: "NoSchedule"
+          containers:
+            - name: ray-worker-gpu
+              image: frc-scouting/ray-worker:latest
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  cpu: "4"
+                  memory: "16Gi"
+                  nvidia.com/gpu: "1"
+                limits:
+                  cpu: "8"
+                  memory: "32Gi"
+                  nvidia.com/gpu: "1"
+              volumeMounts:
+                - mountPath: /dev/shm
+                  name: dshm
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 16Gi

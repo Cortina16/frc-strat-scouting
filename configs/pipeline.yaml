@@ -1,0 +1,72 @@
+# Pipeline runtime configuration
+pipeline:
+  cluster:
+    ray_address: "auto"
+    num_cpus: 64
+    num_gpus: 2
+    object_store_memory: 68719476736 # 64 GB
+    plasma_directory: "/dev/shm"
+  hardware_pinning:
+    gpus:
+      detection_actor:
+        device_id: 0
+        cuda_visible_devices: "0"
+        num_gpus: 1
+      action_recognition_actor:
+        device_id: 1
+        cuda_visible_devices: "1"
+        num_gpus: 1
+    cpu_worker_pool:
+      stream_ingestion_actor: 8
+      homography_actor: 8
+      duckdb_storage_actor: 8
+      tracking_actor: 4
+      reconciliation_actor: 4
+      telemetry_publisher_actor: 4
+    plasma_store:
+      mount_path: "/dev/shm"
+      memory_bytes: 68719476736 # 64 GB
+  stream:
+    target_fps: 60
+    resolution: [1920, 1080]
+    frame_gating_stride: 10 # Evaluate ResNet-18 every 10th frame
+  pipelining:
+    queue_depth: 32
+    batch_size_gpu: 8
+  tracking:
+    kalman_dim: 8 # [xc, yc, w, h, vx, vy, vw, vh]
+    reid_metric: "cosine"
+    reid_thresh: 0.35
+    max_lost_frames_cut: 300 # 5 seconds at 60 FPS
+    max_coast_frames: 30
+  reconciliation:
+    fms_poll_interval_s: 1.0
+    spatial_hub_radius_inches: 60.0
+  storage:
+    duckdb_db_path: ":memory:"
+    parquet_flush_interval_frames: 600
+  transport:
+    mqtt_broker_host: "localhost"
+    mqtt_broker_port: 1883
+    mqtt_topic_root: "frc/2026/telemetry"
+    max_payload_bytes: 51200 # 50 KB ceiling
+  detection:
+    engine_path: "data/models/medium_robo_v3.pt"
+    confidence_threshold: 0.20
+    iou_threshold: 0.28
+    min_bumper_score: 0.10
+    max_robots: 6
+    input_shape: [544, 1920]
+    field_roi_y: [0.12, 0.65]
+    field_bounds_screen: [0.02, 0.98, 0.13, 0.62]
+  roster:
+    red_teams: [1323, 4065, 4414]
+    blue_teams: [868, 2046, 2910]
+  ball_tracking:
+    enabled: true
+    max_balls: 504
+    min_radius_px: 2.5
+    max_radius_px: 30.0
+    distance_match_threshold_px: 25.0
+    max_coast_frames: 20
+
