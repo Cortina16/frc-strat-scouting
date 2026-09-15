@@ -21,7 +21,10 @@ from src.vision.homography import (
     compute_cmc_affine_detailed,
     compute_normalized_dlt,
     detect_camera_cut,
+    estimate_camera_pose_pnp,
     optimize_homography_lm,
+    project_pixel_to_field_3d,
+    project_pixels_to_field_3d_batch,
     project_pixels_to_field_batch,
 )
 from src.vision.ocr_enhancer import (
@@ -41,6 +44,9 @@ __all__ = [
     "HomographyActor",
     "compute_normalized_dlt",
     "optimize_homography_lm",
+    "estimate_camera_pose_pnp",
+    "project_pixel_to_field_3d",
+    "project_pixels_to_field_3d_batch",
     "project_pixels_to_field_batch",
     "compute_cmc_affine_detailed",
     "detect_camera_cut",

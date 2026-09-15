@@ -10,6 +10,7 @@ velocity degradation under defensive pressure, and match aggregates.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -106,6 +107,14 @@ CREATE TABLE IF NOT EXISTS robot_trajectories (
     pixel_confidence FLOAT,
     field_x_inch FLOAT,
     field_y_inch FLOAT,
+    field_z_inch FLOAT,
+    center_rel_x_inch FLOAT,
+    center_rel_y_inch FLOAT,
+    center_rel_z_inch FLOAT,
+    depth_inch FLOAT,
+    robot_width_inch FLOAT,
+    robot_length_inch FLOAT,
+    robot_height_inch FLOAT,
     velocity_x_ips FLOAT,
     velocity_y_ips FLOAT,
     speed_ips FLOAT,
@@ -149,6 +158,11 @@ CREATE TABLE IF NOT EXISTS ball_trajectories (
     pixel_radius FLOAT,
     field_x_inch FLOAT,
     field_y_inch FLOAT,
+    field_z_inch FLOAT,
+    center_rel_x_inch FLOAT,
+    center_rel_y_inch FLOAT,
+    center_rel_z_inch FLOAT,
+    depth_inch FLOAT,
     velocity_x_ips FLOAT,
     velocity_y_ips FLOAT,
     ball_state VARCHAR,
@@ -158,18 +172,42 @@ CREATE TABLE IF NOT EXISTS ball_trajectories (
 );
 """
 
+DDL_CAMERA_POSES: str = """
+CREATE TABLE IF NOT EXISTS camera_poses (
+    match_id VARCHAR,
+    frame_index BIGINT,
+    timestamp_ms BIGINT,
+    camera_x_inch FLOAT,
+    camera_y_inch FLOAT,
+    camera_z_inch FLOAT,
+    rvec_0 FLOAT,
+    rvec_1 FLOAT,
+    rvec_2 FLOAT,
+    tvec_0 FLOAT,
+    tvec_1 FLOAT,
+    tvec_2 FLOAT,
+    focal_length FLOAT,
+    reproj_rmse FLOAT,
+    pnp_converged BOOLEAN,
+    visible_tags VARCHAR,
+    tag_distances VARCHAR
+);
+"""
+
 DDL_INDEXES: str = """
 CREATE INDEX IF NOT EXISTS idx_trajectories_asof ON robot_trajectories (match_id, team_number, timestamp_ms);
 CREATE INDEX IF NOT EXISTS idx_actions_asof ON action_events (match_id, team_number, start_time_ms);
 CREATE INDEX IF NOT EXISTS idx_balls_frame ON ball_trajectories (match_id, frame_index);
+CREATE INDEX IF NOT EXISTS idx_camera_poses_frame ON camera_poses (match_id, frame_index);
 """
 
 
 def create_tables(conn: duckdb.DuckDBPyConnection) -> None:
-    """Creates the columnar tables and indexes for trajectories, balls, and action events."""
+    """Creates the columnar tables and indexes for trajectories, balls, action events, and camera poses."""
     conn.execute(DDL_ROBOT_TRAJECTORIES)
     conn.execute(DDL_ACTION_EVENTS)
     conn.execute(DDL_BALL_TRAJECTORIES)
+    conn.execute(DDL_CAMERA_POSES)
     try:
         conn.execute(DDL_INDEXES)
     except Exception as e:
@@ -195,6 +233,14 @@ if pa is not None:
         ("pixel_confidence", pa.float32()),
         ("field_x_inch", pa.float32()),
         ("field_y_inch", pa.float32()),
+        ("field_z_inch", pa.float32()),
+        ("center_rel_x_inch", pa.float32()),
+        ("center_rel_y_inch", pa.float32()),
+        ("center_rel_z_inch", pa.float32()),
+        ("depth_inch", pa.float32()),
+        ("robot_width_inch", pa.float32()),
+        ("robot_length_inch", pa.float32()),
+        ("robot_height_inch", pa.float32()),
         ("velocity_x_ips", pa.float32()),
         ("velocity_y_ips", pa.float32()),
         ("speed_ips", pa.float32()),
@@ -744,6 +790,23 @@ class DuckDBStore:
         px_conf = [float(t.pixel_bbox.confidence) if t.pixel_bbox else 0.0 for t in trajectories]
         fx = [float(t.field_x_inch) for t in trajectories]
         fy = [float(t.field_y_inch) for t in trajectories]
+        fz = [float(getattr(t, "field_z_inch", 0.0) or 0.0) for t in trajectories]
+        cr_x = [
+            float(getattr(t, "center_rel_x_inch", None) if getattr(t, "center_rel_x_inch", None) is not None else (t.field_x_inch - 325.6))
+            for t in trajectories
+        ]
+        cr_y = [
+            float(getattr(t, "center_rel_y_inch", None) if getattr(t, "center_rel_y_inch", None) is not None else (t.field_y_inch - 158.85))
+            for t in trajectories
+        ]
+        cr_z = [
+            float(getattr(t, "center_rel_z_inch", None) if getattr(t, "center_rel_z_inch", None) is not None else getattr(t, "field_z_inch", 0.0) or 0.0)
+            for t in trajectories
+        ]
+        depths = [float(getattr(t, "depth_inch", 0.0) or 0.0) for t in trajectories]
+        r_widths = [float(getattr(t, "robot_width_inch", 22.0) or 22.0) for t in trajectories]
+        r_lengths = [float(getattr(t, "robot_length_inch", 28.0) or 28.0) for t in trajectories]
+        r_heights = [float(getattr(t, "robot_height_inch", 28.0) or 28.0) for t in trajectories]
         vx = [float(t.velocity_x_ips) for t in trajectories]
         vy = [float(t.velocity_y_ips) for t in trajectories]
         speeds = [
@@ -789,6 +852,14 @@ class DuckDBStore:
                 pa.array(px_conf, type=pa.float32()),
                 pa.array(fx, type=pa.float32()),
                 pa.array(fy, type=pa.float32()),
+                pa.array(fz, type=pa.float32()),
+                pa.array(cr_x, type=pa.float32()),
+                pa.array(cr_y, type=pa.float32()),
+                pa.array(cr_z, type=pa.float32()),
+                pa.array(depths, type=pa.float32()),
+                pa.array(r_widths, type=pa.float32()),
+                pa.array(r_lengths, type=pa.float32()),
+                pa.array(r_heights, type=pa.float32()),
                 pa.array(vx, type=pa.float32()),
                 pa.array(vy, type=pa.float32()),
                 pa.array(speeds, type=pa.float32()),
@@ -819,6 +890,14 @@ class DuckDBStore:
                     px_conf,
                     fx,
                     fy,
+                    fz,
+                    cr_x,
+                    cr_y,
+                    cr_z,
+                    depths,
+                    r_widths,
+                    r_lengths,
+                    r_heights,
                     vx,
                     vy,
                     speeds,
@@ -827,7 +906,7 @@ class DuckDBStore:
                     in_def,
                 )
             )
-            sql = "INSERT INTO robot_trajectories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            sql = "INSERT INTO robot_trajectories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             self._con.executemany(sql, rows)
 
         return count
@@ -857,6 +936,11 @@ class DuckDBStore:
                 float(b.radius_px),
                 float(b.field_x_inch),
                 float(b.field_y_inch),
+                float(getattr(b, "field_z_inch", 2.955) if getattr(b, "field_z_inch", None) is not None else 2.955),
+                float(getattr(b, "center_rel_x_inch", None) if getattr(b, "center_rel_x_inch", None) is not None else (b.field_x_inch - 325.6)),
+                float(getattr(b, "center_rel_y_inch", None) if getattr(b, "center_rel_y_inch", None) is not None else (b.field_y_inch - 158.85)),
+                float(getattr(b, "center_rel_z_inch", None) if getattr(b, "center_rel_z_inch", None) is not None else getattr(b, "field_z_inch", 2.955)),
+                float(getattr(b, "depth_inch", 0.0) or 0.0),
                 float(b.velocity_x_ips),
                 float(b.velocity_y_ips),
                 b.state.value if hasattr(b.state, "value") else str(b.state),
@@ -866,7 +950,47 @@ class DuckDBStore:
             )
             for b in balls
         ]
-        sql = "INSERT INTO ball_trajectories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        sql = "INSERT INTO ball_trajectories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        self._con.executemany(sql, rows)
+        return count
+
+    def insert_camera_poses(
+        self,
+        poses: Sequence[Any],
+        match_id: Optional[str] = None,
+    ) -> int:
+        """Appends camera pose estimation records to the `camera_poses` table."""
+        if not poses:
+            return 0
+        m_id = match_id or self.default_match_id
+        count = len(poses)
+        rows = []
+        for p in poses:
+            c = getattr(p, "camera_center", (0.0, 0.0, 0.0))
+            if c is None:
+                c = (0.0, 0.0, 0.0)
+            rv = getattr(p, "rvec", (0.0, 0.0, 0.0))
+            if rv is None:
+                rv = (0.0, 0.0, 0.0)
+            tv = getattr(p, "tvec", (0.0, 0.0, 0.0))
+            if tv is None:
+                tv = (0.0, 0.0, 0.0)
+            vis_tags = getattr(p, "visible_tags", []) or []
+            tag_dists = getattr(p, "tag_distances", {}) or {}
+            rows.append((
+                getattr(p, "match_id", m_id) or m_id,
+                int(p.frame_index),
+                int(p.timestamp_ms),
+                float(c[0]), float(c[1]), float(c[2]),
+                float(rv[0]), float(rv[1]), float(rv[2]),
+                float(tv[0]), float(tv[1]), float(tv[2]),
+                float(getattr(p, "focal_length", 1250.6) or 1250.6),
+                float(getattr(p, "reproj_rmse", 0.0) or 0.0),
+                bool(getattr(p, "converged", False)),
+                json.dumps(vis_tags),
+                json.dumps({str(k): float(v) for k, v in tag_dists.items()}),
+            ))
+        sql = "INSERT INTO camera_poses VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         self._con.executemany(sql, rows)
         return count
 
@@ -1035,12 +1159,19 @@ class DuckDBStore:
         traj_file = os.path.join(output_path, "robot_trajectories.parquet")
         actions_file = os.path.join(output_path, "action_events.parquet")
         balls_file = os.path.join(output_path, "ball_trajectories.parquet")
+        camera_file = os.path.join(output_path, "camera_poses.parquet")
         export_table_to_parquet(self._con, "robot_trajectories", traj_file)
         export_table_to_parquet(self._con, "action_events", actions_file)
         try:
             cnt_row = self._con.execute("SELECT COUNT(*) FROM ball_trajectories").fetchone()
             if cnt_row and cnt_row[0] > 0:
                 export_table_to_parquet(self._con, "ball_trajectories", balls_file)
+        except Exception:
+            pass
+        try:
+            cam_cnt = self._con.execute("SELECT COUNT(*) FROM camera_poses").fetchone()
+            if cam_cnt and cam_cnt[0] > 0:
+                export_table_to_parquet(self._con, "camera_poses", camera_file)
         except Exception:
             pass
         return traj_file
@@ -1183,6 +1314,14 @@ class DuckDBStorageActor(StorageActorBase):
         async with self._lock:
             self._store.insert_action_events(
                 actions=actions,
+                match_id=self.match_id,
+            )
+
+    async def insert_camera_poses(self, poses: Sequence[Any]) -> None:
+        """Appends camera pose estimation records to DuckDB camera_poses table."""
+        async with self._lock:
+            self._store.insert_camera_poses(
+                poses=poses,
                 match_id=self.match_id,
             )
 

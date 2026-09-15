@@ -29,6 +29,7 @@ from src.common.types import (
     ActionSegment,
     BallTrackletState,
     BoundingBox,
+    CameraPoseState,
     DetectionResult,
     FieldAPIScoreState,
     HomographyEstimate,
@@ -750,7 +751,30 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                     else:
                         batch_ball_tracks = [[] for _ in batch]
 
-                    await tracking_to_action.put((batch, batch_active_tracks, batch_ball_tracks))
+                    # Camera Pose Extraction
+                    batch_camera_poses: List[CameraPoseState] = []
+                    for i, frame in enumerate(batch):
+                        h_est = estimates[i] if i < len(estimates) else None
+                        if h_est is not None:
+                            c_center = tuple(float(x) for x in h_est.camera_center) if h_est.camera_center is not None else (0.0, 0.0, 0.0)
+                            r_vec = tuple(float(x) for x in h_est.camera_pose_rvec.ravel()) if h_est.camera_pose_rvec is not None else (0.0, 0.0, 0.0)
+                            t_vec = tuple(float(x) for x in h_est.camera_pose_tvec.ravel()) if h_est.camera_pose_tvec is not None else (0.0, 0.0, 0.0)
+                            pose = CameraPoseState(
+                                match_id=self.match_id,
+                                frame_index=frame.metadata.frame_index,
+                                timestamp_ms=frame.metadata.pts_ms,
+                                camera_center=c_center,
+                                rvec=r_vec,
+                                tvec=t_vec,
+                                focal_length=float(h_est.focal_length or 1250.6),
+                                reproj_rmse=float(h_est.lm_rmse or 0.0),
+                                converged=bool(h_est.converged),
+                                visible_tags=getattr(h_est, "visible_tags", []),
+                                tag_distances=getattr(h_est, "tag_distances", {}),
+                            )
+                            batch_camera_poses.append(pose)
+
+                    await tracking_to_action.put((batch, batch_active_tracks, batch_ball_tracks, batch_camera_poses))
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
@@ -769,6 +793,7 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                     batch = item[0]
                     batch_active_tracks = item[1]
                     batch_ball_tracks = item[2] if len(item) > 2 else [[] for _ in batch]
+                    batch_camera_poses = item[3] if len(item) > 3 else []
                     batch_candidates: List[List[ActionSegment]] = [[] for _ in range(len(batch))]
                     batch_positions: List[Dict[int, Tuple[float, float]]] = []
 
@@ -841,7 +866,7 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                                 batch_candidates[-1].append(a)
 
                     await action_to_reconciliation.put(
-                        (batch, batch_active_tracks, batch_candidates, batch_positions, batch_ball_tracks)
+                        (batch, batch_active_tracks, batch_candidates, batch_positions, batch_ball_tracks, batch_camera_poses)
                     )
             except asyncio.CancelledError:
                 pass
@@ -863,6 +888,7 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                     batch_candidates = item[2]
                     batch_positions = item[3]
                     batch_ball_tracks = item[4] if len(item) > 4 else [[] for _ in batch]
+                    batch_camera_poses = item[5] if len(item) > 5 else []
                     batch_reconciled: List[List[ActionSegment]] = [[] for _ in range(len(batch))]
 
                     all_candidates: List[ActionSegment] = []
@@ -892,7 +918,7 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                             if cand.event_id in rec_by_id:
                                 batch_reconciled[f_idx].append(rec_by_id[cand.event_id])
 
-                    await reconciliation_to_sink.put((batch, batch_active_tracks, batch_reconciled, batch_ball_tracks))
+                    await reconciliation_to_sink.put((batch, batch_active_tracks, batch_reconciled, batch_ball_tracks, batch_camera_poses))
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
@@ -913,6 +939,7 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                     batch_active_tracks = item[1]
                     batch_reconciled = item[2]
                     batch_ball_tracks = item[3] if len(item) > 3 else [[] for _ in batch]
+                    batch_camera_poses = item[4] if len(item) > 4 else []
 
                     # Storage writer task
                     async def _write_storage() -> None:
@@ -957,6 +984,14 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                                         b_states,
                                         frame.metadata.frame_index,
                                     )
+
+                        # Write camera poses if present
+                        if hasattr(actors.storage, "insert_camera_poses") and batch_camera_poses:
+                            await call_actor(
+                                actors.storage,
+                                "insert_camera_poses",
+                                batch_camera_poses,
+                            )
 
                     # Telemetry publisher task
                     async def _publish_telemetry() -> None:
@@ -1127,6 +1162,20 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                 )
             except Exception as exc:
                 logger.debug("Exception exporting balls parquet: %s", exc)
+
+            try:
+                camera_out_file = os.path.join(
+                    self.parquet_export_dir,
+                    f"match_{self._match_id}_camera_poses.parquet",
+                )
+                camera_parquet_path = await call_actor(
+                    self.actors.storage,
+                    "export_match_parquet",
+                    camera_out_file,
+                    "camera_poses",
+                )
+            except Exception as exc:
+                logger.debug("Exception exporting camera_poses parquet: %s", exc)
 
             try:
                 summary_metrics = await call_actor(
@@ -1498,6 +1547,31 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                     frame_index,
                 )
                 self._total_trajectories_inserted += len(active_tracks)
+
+        # Store camera poses if available
+        if hasattr(self.actors.storage, "insert_camera_poses") and estimates:
+            poses = []
+            for i, frame in enumerate(batch):
+                h_est = estimates[i] if i < len(estimates) else None
+                if h_est is not None:
+                    c_center = tuple(float(x) for x in h_est.camera_center) if h_est.camera_center is not None else (0.0, 0.0, 0.0)
+                    r_vec = tuple(float(x) for x in h_est.camera_pose_rvec.ravel()) if h_est.camera_pose_rvec is not None else (0.0, 0.0, 0.0)
+                    t_vec = tuple(float(x) for x in h_est.camera_pose_tvec.ravel()) if h_est.camera_pose_tvec is not None else (0.0, 0.0, 0.0)
+                    poses.append(CameraPoseState(
+                        match_id=self.match_id,
+                        frame_index=frame.metadata.frame_index,
+                        timestamp_ms=frame.metadata.pts_ms,
+                        camera_center=c_center,
+                        rvec=r_vec,
+                        tvec=t_vec,
+                        focal_length=float(h_est.focal_length or 1250.6),
+                        reproj_rmse=float(h_est.lm_rmse or 0.0),
+                        converged=bool(h_est.converged),
+                        visible_tags=getattr(h_est, "visible_tags", []),
+                        tag_distances=getattr(h_est, "tag_distances", {}),
+                    ))
+            if poses:
+                await call_actor(self.actors.storage, "insert_camera_poses", poses)
 
         # 5. Batched Live Telemetry Publishing (1 RPC)
         payloads = [

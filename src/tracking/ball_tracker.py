@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from typing import Dict, List, Optional, Sequence, Tuple
+import cv2
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -23,10 +24,14 @@ from src.common.types import (
     BoundingBox,
     HomographyEstimate,
 )
+from src.vision.homography import project_pixel_to_field_3d
 
 logger = logging.getLogger("frc.tracking.ball_tracker")
 
 BALL_CLASS_ID: int = 1
+FUEL_DIAMETER_INCH: float = 5.91
+FUEL_RADIUS_INCH: float = 2.955
+CARPET_CENTER_ELEVATION_INCH: float = 2.955
 
 
 class SingleBallKalman:
@@ -155,9 +160,9 @@ class BallTrack:
         self.coast_frames = 0
         self.occluded_by_robot_id = None
 
-        # Speed check for in-flight projectile state
+        # Speed check for in-flight projectile state (scaled to per-frame velocity at 60 FPS)
         speed_px = np.hypot(self.vx_px, self.vy_px)
-        if speed_px > 120.0 or (self.vy_px < -30.0 and speed_px > 60.0):
+        if speed_px > 6.0 or (self.vy_px < -2.0 and speed_px > 3.0):
             self.state = BallState.IN_FLIGHT
         else:
             self.state = BallState.ON_CARPET
@@ -320,8 +325,54 @@ class BallTracker:
             if t.state == BallState.REMOVED:
                 continue
 
-            # Field projection
-            if h_inv is not None:
+            # Field projection (3D ray projection at carpet ball center elevation Z=2.955" or in-flight 3D elevation)
+            ball_z = CARPET_CENTER_ELEVATION_INCH
+            ball_depth = 0.0
+            if homography is not None and homography.camera_center is not None and homography.camera_pose_rvec is not None:
+                f_cam = homography.focal_length or 1250.6
+                K_cam = np.array([[f_cam, 0.0, 960.0], [0.0, f_cam, 540.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+                # 1. 3D optical ray in world space from camera optical center
+                R_cam, _ = cv2.Rodrigues(homography.camera_pose_rvec)
+                C_cam = homography.camera_center
+                p_cam = np.linalg.inv(K_cam) @ np.array([t.center_x, t.center_y, 1.0], dtype=np.float64)
+                d_world = (R_cam.T @ p_cam).ravel()
+                ray_norm = np.linalg.norm(d_world)
+                d_unit = d_world / ray_norm if ray_norm > 1e-9 else np.array([0.0, 0.0, -1.0])
+
+                # 2. Floor carpet plane intersection (Z = 2.955")
+                c_3d_carpet, depth_carpet = project_pixel_to_field_3d(
+                    pixel_u=t.center_x,
+                    pixel_v=t.center_y,
+                    elevation_inch=CARPET_CENTER_ELEVATION_INCH,
+                    rvec=homography.camera_pose_rvec,
+                    tvec=homography.camera_pose_tvec,
+                    camera_matrix=K_cam,
+                    camera_center=homography.camera_center,
+                    h_floor=homography.h_matrix,
+                )
+
+                # 3. Known FUEL sphere 5.91" diameter apparent depth calculation:
+                # Apparent depth: lambda = (f * 2.955) / r_px
+                r_obs = max(1.5, t.radius)
+                lambda_pinhole = float(f_cam * FUEL_RADIUS_INCH / r_obs)
+                P_pinhole = C_cam + lambda_pinhole * d_unit
+                z_pinhole = float(P_pinhole[2])
+
+                # 4. In-Flight vs Carpet classification:
+                # If apparent elevation Z > 4.5" (and within playing envelope Z <= 120") and within field bounds, or track is in flight:
+                if (z_pinhole > 4.5 and z_pinhole <= 120.0 and 0.0 <= P_pinhole[0] <= 651.2 and 0.0 <= P_pinhole[1] <= 317.7) or t.state == BallState.IN_FLIGHT:
+                    t.state = BallState.IN_FLIGHT
+                    t.field_x = float(P_pinhole[0])
+                    t.field_y = float(P_pinhole[1])
+                    ball_z = float(np.clip(z_pinhole, 4.5, 95.0))
+                    ball_depth = float(lambda_pinhole)
+                else:
+                    t.field_x = float(c_3d_carpet[0])
+                    t.field_y = float(c_3d_carpet[1])
+                    ball_z = CARPET_CENTER_ELEVATION_INCH
+                    ball_depth = float(depth_carpet)
+            elif h_inv is not None:
                 p_px = np.array([t.center_x, t.center_y, 1.0], dtype=np.float64)
                 p_field = h_inv @ p_px
                 if abs(p_field[2]) > 1e-6:
@@ -343,6 +394,10 @@ class BallTracker:
                 class_id=BALL_CLASS_ID,
             )
 
+            cr_x = float(t.field_x - 325.6)
+            cr_y = float(t.field_y - 158.85)
+            cr_z = float(ball_z)
+
             results.append(
                 BallTrackletState(
                     ball_id=t.ball_id,
@@ -353,6 +408,11 @@ class BallTracker:
                     velocity_y_ips=t.field_vy,
                     radius_px=t.radius,
                     state=t.state,
+                    field_z_inch=ball_z,
+                    depth_inch=ball_depth,
+                    center_rel_x_inch=cr_x,
+                    center_rel_y_inch=cr_y,
+                    center_rel_z_inch=cr_z,
                     occluded_by_robot_id=t.occluded_by_robot_id,
                     coast_frames=t.coast_frames,
                     is_cluster=False,
@@ -367,8 +427,25 @@ class BallTracker:
             for c in clusters:
                 if remaining_quota <= 0:
                     break
-                c_field_x, c_field_y = 0.0, 0.0
-                if h_inv is not None:
+                c_field_x, c_field_y, c_field_z = 0.0, 0.0, CARPET_CENTER_ELEVATION_INCH
+                c_depth = 0.0
+                if homography is not None and homography.camera_center is not None and homography.camera_pose_rvec is not None:
+                    f_cam = homography.focal_length or 1250.6
+                    K_cam = np.array([[f_cam, 0.0, 960.0], [0.0, f_cam, 540.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+                    c_3d, c_depth = project_pixel_to_field_3d(
+                        pixel_u=c.centroid_x,
+                        pixel_v=c.centroid_y,
+                        elevation_inch=CARPET_CENTER_ELEVATION_INCH,
+                        rvec=homography.camera_pose_rvec,
+                        tvec=homography.camera_pose_tvec,
+                        camera_matrix=K_cam,
+                        camera_center=homography.camera_center,
+                        h_floor=homography.h_matrix,
+                    )
+                    c_field_x = c_3d[0]
+                    c_field_y = c_3d[1]
+                    c_field_z = c_3d[2]
+                elif h_inv is not None:
                     p_px = np.array([c.centroid_x, c.centroid_y, 1.0], dtype=np.float64)
                     p_field = h_inv @ p_px
                     if abs(p_field[2]) > 1e-6:
@@ -388,6 +465,11 @@ class BallTracker:
                         velocity_y_ips=0.0,
                         radius_px=c_radius,
                         state=BallState.ON_CARPET,
+                        field_z_inch=c_field_z,
+                        depth_inch=c_depth,
+                        center_rel_x_inch=float(c_field_x - 325.6),
+                        center_rel_y_inch=float(c_field_y - 158.85),
+                        center_rel_z_inch=float(c_field_z),
                         occluded_by_robot_id=None,
                         coast_frames=0,
                         is_cluster=True,

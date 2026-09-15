@@ -41,6 +41,7 @@ from src.tracking.reid import (
     cosine_distance,
     normalize_embedding,
 )
+from src.vision.homography import project_pixel_to_field_3d
 
 
 def box_iou(
@@ -260,6 +261,14 @@ class STrack:
         # Physical field coordinates and kinematics
         self.field_x_inch: float = 0.0
         self.field_y_inch: float = 0.0
+        self.field_z_inch: float = 0.0
+        self.center_rel_x_inch: float = -325.6
+        self.center_rel_y_inch: float = -158.85
+        self.center_rel_z_inch: float = 0.0
+        self.depth_inch: float = 0.0
+        self.robot_width_inch: float = 22.0
+        self.robot_length_inch: float = 28.0
+        self.robot_height_inch: float = 28.0
         self.velocity_x_ips: float = 0.0
         self.velocity_y_ips: float = 0.0
         self.heading_rad: float = 0.0
@@ -403,19 +412,50 @@ class STrack:
 
     def update_field_geometry(
         self,
-        h_matrix: Optional[np.ndarray],
-        timestamp_ms: Optional[int],
-        frame_index: int,
+        h_matrix: Optional[Union[np.ndarray, HomographyEstimate]],
+        timestamp_ms: Optional[int] = None,
+        frame_index: int = 0,
         target_fps: float = 60.0,
+        homography_estimate: Optional[HomographyEstimate] = None,
     ) -> None:
-        """Projects pixel center (xc, yc) into field CAD coordinates (x, y) in inches and computes velocities."""
+        """
+        Projects robot ground contact patch (bounding box bottom center) into field CAD coordinates
+        (x, y) in inches on the carpet floor (Z=0), computes 3D Euclidean camera depth, and calculates velocities.
+        """
+        est = homography_estimate
+        if isinstance(h_matrix, HomographyEstimate):
+            est = h_matrix
+            h_mat = est.h_matrix
+        else:
+            h_mat = h_matrix
+
         xc = self.pixel_bbox.center_x
         yc = self.pixel_bbox.center_y
 
-        if h_matrix is not None:
+        # For elevated broadcast views where 3D camera pose is solved, project the carpet contact patch (bottom center)
+        # using full 3D ray back-projection; for planar homographies without camera pose, use bbox center.
+        if est is not None and est.camera_center is not None and est.camera_pose_rvec is not None:
+            yc_contact = yc + 0.5 * self.pixel_bbox.height
+            f_cam = est.focal_length or 1250.6
+            K_cam = np.array([[f_cam, 0.0, 960.0], [0.0, f_cam, 540.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+            c_3d, r_depth = project_pixel_to_field_3d(
+                pixel_u=xc,
+                pixel_v=yc_contact,
+                elevation_inch=0.0,
+                rvec=est.camera_pose_rvec,
+                tvec=est.camera_pose_tvec,
+                camera_matrix=K_cam,
+                camera_center=est.camera_center,
+                h_floor=h_mat,
+            )
+            new_x = float(c_3d[0])
+            new_y = float(c_3d[1])
+            self.depth_inch = float(r_depth)
+        elif h_mat is not None:
+            yc_contact = yc + (0.5 * self.pixel_bbox.height if (est is not None and est.camera_center is not None) else 0.0)
             try:
-                H_inv = np.linalg.inv(h_matrix)
-                p_hom = np.array([xc, yc, 1.0], dtype=np.float64)
+                H_inv = np.linalg.inv(h_mat)
+                p_hom = np.array([xc, yc_contact, 1.0], dtype=np.float64)
                 proj = np.dot(H_inv, p_hom)
                 z = proj[2]
                 if abs(z) < 1e-12:
@@ -424,8 +464,59 @@ class STrack:
                 new_y = float(proj[1] / z)
             except np.linalg.LinAlgError:
                 new_x, new_y = xc, yc
+            self.depth_inch = float(np.linalg.norm(np.array([new_x, new_y, 0.0]) - est.camera_center)) if (est is not None and est.camera_center is not None) else 0.0
         else:
             new_x, new_y = xc, yc
+            self.depth_inch = 0.0
+
+        # Hub Physical Exclusion Zone Enforcement:
+        # Red Hub at (162.8, 158.85), Blue Hub at (488.4, 158.85).
+        # Solid base radius (~23.5") + robot half-width (~11") => minimum physical clearance = 34.0"
+        min_hub_clearance = 33.5
+        dist_red = np.hypot(new_x - 162.8, new_y - 158.85)
+        dist_blue = np.hypot(new_x - 488.4, new_y - 158.85)
+        if dist_red < min_hub_clearance and dist_red > 1e-3:
+            scale = min_hub_clearance / dist_red
+            new_x = 162.8 + (new_x - 162.8) * scale
+            new_y = 158.85 + (new_y - 158.85) * scale
+        elif dist_blue < min_hub_clearance and dist_blue > 1e-3:
+            scale = min_hub_clearance / dist_blue
+            new_x = 488.4 + (new_x - 488.4) * scale
+            new_y = 158.85 + (new_y - 158.85) * scale
+
+        # Boundary guardrails
+        new_x = float(np.clip(new_x, 10.0, 641.2))
+        new_y = float(np.clip(new_y, 10.0, 307.7))
+
+        self.field_z_inch = 0.0  # Robot carpet contact elevation
+
+        # Field-center relative coordinates (Center = 325.6, 158.85, 0.0)
+        self.center_rel_x_inch = float(new_x - 325.6)
+        self.center_rel_y_inch = float(new_y - 158.85)
+        self.center_rel_z_inch = float(self.field_z_inch)
+
+        # Estimate live robot dimensions from bounding box, distance, and focal length
+        # Nominal FRC robot base is roughly 22 inches by 28 inches
+        if (
+            est is not None
+            and est.focal_length is not None
+            and est.focal_length > 10.0
+            and self.depth_inch > 10.0
+            and self.pixel_bbox is not None
+        ):
+            w_live = float(self.pixel_bbox.width * self.depth_inch / est.focal_length)
+            h_live = float(self.pixel_bbox.height * self.depth_inch / est.focal_length)
+            w_est = float(np.clip(w_live, 18.0, 36.0))
+            h_est = float(np.clip(h_live, 12.0, 48.0))
+            l_est = float(np.clip(28.0 * (w_est / 22.0), 20.0, 38.0))
+            # Smooth dimension estimates
+            self.robot_width_inch = float(0.15 * w_est + 0.85 * self.robot_width_inch)
+            self.robot_height_inch = float(0.15 * h_est + 0.85 * self.robot_height_inch)
+            self.robot_length_inch = float(0.15 * l_est + 0.85 * self.robot_length_inch)
+        else:
+            self.robot_width_inch = 22.0
+            self.robot_length_inch = 28.0
+            self.robot_height_inch = 28.0
 
         if self.has_field_coords:
             if (
@@ -461,6 +552,9 @@ class STrack:
         self.last_timestamp_ms = timestamp_ms
         self.last_field_frame = frame_index
 
+    # Alias for update_field_geometry
+    update_field_coords = update_field_geometry
+
     def to_robot_tracklet_state(self) -> RobotTrackletState:
         """Converts internal track state to public DTO RobotTrackletState."""
         t_num = self.team_number if self.team_number is not None else self.confirmed_team_number
@@ -475,6 +569,14 @@ class STrack:
             velocity_y_ips=self.velocity_y_ips,
             heading_rad=self.heading_rad,
             track_state=self.state,
+            field_z_inch=self.field_z_inch,
+            depth_inch=self.depth_inch,
+            center_rel_x_inch=self.center_rel_x_inch,
+            center_rel_y_inch=self.center_rel_y_inch,
+            center_rel_z_inch=self.center_rel_z_inch,
+            robot_width_inch=self.robot_width_inch,
+            robot_length_inch=self.robot_length_inch,
+            robot_height_inch=self.robot_height_inch,
             reid_embedding=self.reid_embedding.copy() if self.reid_embedding is not None else None,
         )
 
@@ -762,6 +864,7 @@ class BoTSORT:
                 timestamp_ms=ts_ms,
                 frame_index=frame_index,
                 target_fps=self.target_fps,
+                homography_estimate=homography,
             )
 
         # 8. Reconcile team assignments across alliances via bipartite matching

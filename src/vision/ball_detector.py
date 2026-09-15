@@ -44,8 +44,8 @@ class YellowBallDetector:
         min_radius_px: float = 2.5,
         max_radius_px: float = 30.0,
         min_separation_px: float = 7.0,
-        field_roi_y: Tuple[float, float] = (0.12, 0.65),
-        field_bounds_screen: Tuple[float, float, float, float] = (0.02, 0.98, 0.13, 0.62),
+        field_roi_y: Tuple[float, float] = (0.05, 0.94),
+        field_bounds_screen: Tuple[float, float, float, float] = (0.01, 0.99, 0.05, 0.92),
         nominal_ball_radius_px: float = 6.5,
         packing_efficiency: float = 0.82,
         robot_catchment_margin: float = 40.0,
@@ -250,26 +250,40 @@ class YellowBallDetector:
                 bh = float(stats[i, cv2.CC_STAT_HEIGHT])
 
                 est_count = max(1, int(round(area / effective_ball_area)))
-                pct = float((est_count / float(self.max_balls)) * 100.0)
 
-                clusters.append(
-                    BallCluster(
-                        cluster_id=i,
-                        centroid_x=cx,
-                        centroid_y=cy,
-                        bbox=BoundingBox(
+                # Small ambient components (1-2 balls) in open field are extracted as discrete individual balls
+                if est_count <= 2 and len(individual_boxes) < self.max_balls:
+                    diameter = max(4.0, min(bw, bh))
+                    individual_boxes.append(
+                        BoundingBox(
                             center_x=cx,
                             center_y=cy,
-                            width=bw,
-                            height=bh,
+                            width=diameter,
+                            height=diameter,
                             confidence=0.85,
                             class_id=self.BALL_CLASS_ID,
-                        ),
-                        area_px=float(area),
-                        estimated_ball_count=est_count,
-                        inventory_pct=pct,
+                        )
                     )
-                )
+                else:
+                    pct = float((est_count / float(self.max_balls)) * 100.0)
+                    clusters.append(
+                        BallCluster(
+                            cluster_id=i,
+                            centroid_x=cx,
+                            centroid_y=cy,
+                            bbox=BoundingBox(
+                                center_x=cx,
+                                center_y=cy,
+                                width=bw,
+                                height=bh,
+                                confidence=0.85,
+                                class_id=self.BALL_CLASS_ID,
+                            ),
+                            area_px=float(area),
+                            estimated_ball_count=est_count,
+                            inventory_pct=pct,
+                        )
+                    )
 
         # Cap individual boxes to max_balls
         if len(individual_boxes) > self.max_balls:

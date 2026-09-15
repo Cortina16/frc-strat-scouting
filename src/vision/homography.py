@@ -17,7 +17,7 @@ from typing import Any, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, minimize_scalar
 
 from src.common.interfaces import HomographyActorBase, HomographyActorProtocol
 from src.common.types import (
@@ -208,6 +208,254 @@ def project_pixels_to_field_batch(
     z = proj[:, 2:3]
     z_safe = np.where(np.abs(z) < 1e-12, 1e-12, z)
     return proj[:, :2] / z_safe
+ 
+ 
+def estimate_camera_pose_pnp(
+    object_points_3d: np.ndarray,
+    image_points_2d: np.ndarray,
+    camera_matrix: Optional[np.ndarray] = None,
+    image_shape: Tuple[int, int] = (1080, 1920),
+    optimize_focal: bool = True,
+    default_focal_length: float = 1250.6,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, bool]:
+    """
+    Solves Perspective-n-Point (PnP) pose estimation using 3D CAD object coordinates
+    and 2D image coordinates. Computes camera rotation, translation, camera optical center,
+    and the induced ground-plane homography H_floor.
+
+    Args:
+        object_points_3d: Array of shape (N, 3) in physical field inches (X, Y, Z).
+        image_points_2d: Array of shape (N, 2) in image pixels (u, v).
+        camera_matrix: Optional 3x3 intrinsic matrix K.
+        image_shape: (height, width) of image, default (1080, 1920).
+        optimize_focal: Whether to optimize focal length if camera_matrix is None.
+        default_focal_length: Fallback focal length if optimization is skipped or fails.
+
+    Returns:
+        Tuple of:
+            - rvec: (3, 1) rotation vector (float64)
+            - tvec: (3, 1) translation vector (float64)
+            - camera_center: (3,) camera optical center C = -R^T T in field inches
+            - H_floor: (3, 3) ground plane homography matrix K [r1, r2, t] (normalized H[2,2]=1.0)
+            - reproj_rmse: Reprojection root-mean-square error in pixels
+            - focal_length: Effective focal length f in pixels
+            - success: True if PnP solved successfully with acceptable residual
+    """
+    obj_pts = np.asarray(object_points_3d, dtype=np.float64)
+    img_pts = np.asarray(image_points_2d, dtype=np.float64)
+    n_pts = len(obj_pts)
+    if n_pts < 4:
+        raise ValueError(f"estimate_camera_pose_pnp requires >= 4 points, got {n_pts}")
+
+    h_img, w_img = image_shape
+    cx = float(w_img) / 2.0
+    cy = float(h_img) / 2.0
+    scale = float(w_img) / 1920.0
+
+    if camera_matrix is not None:
+        K = np.asarray(camera_matrix, dtype=np.float64)
+        f_val = float(K[0, 0])
+    elif optimize_focal and n_pts >= 5:
+        # Optimize focal length using bounded 1D scalar minimization
+        def pnp_cost(f_candidate: float) -> float:
+            K_cand = np.array([
+                [f_candidate, 0.0, cx],
+                [0.0, f_candidate, cy],
+                [0.0, 0.0, 1.0],
+            ], dtype=np.float64)
+            ok, r_tmp, t_tmp = cv2.solvePnP(
+                obj_pts, img_pts, K_cand, None, flags=cv2.SOLVEPNP_ITERATIVE
+            )
+            if not ok:
+                return 1e6
+            try:
+                r_tmp, t_tmp = cv2.solvePnPRefineLM(obj_pts, img_pts, K_cand, None, r_tmp, t_tmp)
+            except Exception:
+                pass
+            p_cand, _ = cv2.projectPoints(obj_pts, r_tmp, t_tmp, K_cand, None)
+            res = p_cand.reshape(-1, 2) - img_pts
+            return float(np.sqrt(np.mean(np.sum(res**2, axis=1))))
+
+        f_low = max(400.0 * scale, 300.0)
+        f_high = min(3500.0 * scale, 4000.0)
+        try:
+            res_opt = minimize_scalar(pnp_cost, bounds=(f_low, f_high), method="bounded")
+            f_val = float(res_opt.x) if (res_opt.success and res_opt.fun < 100.0) else default_focal_length * scale
+        except Exception:
+            f_val = default_focal_length * scale
+
+        K = np.array([
+            [f_val, 0.0, cx],
+            [0.0, f_val, cy],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+    else:
+        f_val = default_focal_length * scale
+        K = np.array([
+            [f_val, 0.0, cx],
+            [0.0, f_val, cy],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+
+    # Solve PnP with RANSAC for >= 5 points, or standard iterative for 4 points
+    if n_pts >= 5:
+        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+            obj_pts,
+            img_pts,
+            K,
+            None,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+            reprojectionError=8.0,
+            iterationsCount=1000,
+        )
+        if ok and inliers is not None and len(inliers) >= 4:
+            obj_inliers = obj_pts[inliers.ravel()]
+            img_inliers = img_pts[inliers.ravel()]
+            try:
+                rvec, tvec = cv2.solvePnPRefineLM(obj_inliers, img_inliers, K, None, rvec, tvec)
+            except Exception:
+                pass
+    else:
+        ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, None, flags=cv2.SOLVEPNP_ITERATIVE)
+        if ok:
+            try:
+                rvec, tvec = cv2.solvePnPRefineLM(obj_pts, img_pts, K, None, rvec, tvec)
+            except Exception:
+                pass
+
+    if not ok or rvec is None or tvec is None:
+        return (
+            np.zeros((3, 1), dtype=np.float64),
+            np.zeros((3, 1), dtype=np.float64),
+            np.zeros(3, dtype=np.float64),
+            np.eye(3, dtype=np.float64),
+            999.0,
+            f_val,
+            False,
+        )
+
+    # Calculate camera optical center in world coordinates: C = -R^T * T
+    R, _ = cv2.Rodrigues(rvec)
+    camera_center = (-R.T @ tvec).ravel().astype(np.float64)
+
+    # Compute carpet floor homography (Z=0 plane):
+    # [u, v, 1]^T ~ K [r1, r2, t] [X, Y, 1]^T
+    H_floor = K @ np.column_stack([R[:, 0], R[:, 1], tvec])
+    if abs(H_floor[2, 2]) > 1e-12:
+        H_floor /= H_floor[2, 2]
+
+    # Calculate reprojection RMSE
+    proj_pts, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, None)
+    errs = proj_pts.reshape(-1, 2) - img_pts
+    rmse = float(np.sqrt(np.mean(np.sum(errs**2, axis=1))))
+    success = bool(rmse < 10.0 and abs(H_floor[2, 2]) > 1e-6)
+
+    return rvec, tvec, camera_center, H_floor, rmse, f_val, success
+
+
+def project_pixel_to_field_3d(
+    pixel_u: float,
+    pixel_v: float,
+    elevation_inch: float = 0.0,
+    rvec: Optional[np.ndarray] = None,
+    tvec: Optional[np.ndarray] = None,
+    camera_matrix: Optional[np.ndarray] = None,
+    camera_center: Optional[np.ndarray] = None,
+    h_floor: Optional[np.ndarray] = None,
+) -> Tuple[Tuple[float, float, float], float]:
+    """
+    Projects 2D pixel coordinates (u, v) into physical 3D field coordinates (X, Y, Z) in inches
+    at a given plane elevation Z = elevation_inch, and computes Euclidean depth from camera.
+
+    Args:
+        pixel_u: Pixel X coordinate.
+        pixel_v: Pixel Y coordinate.
+        elevation_inch: Target elevation Z in inches (0.0 for carpet floor, 2.955 for fuel ball center).
+        rvec: Optional camera rotation vector (3, 1).
+        tvec: Optional camera translation vector (3, 1).
+        camera_matrix: Optional 3x3 intrinsic matrix K.
+        camera_center: Optional 3D camera optical center (X, Y, Z) in inches.
+        h_floor: Optional 3x3 floor homography matrix.
+
+    Returns:
+        Tuple of:
+            - field_coords_3d: (X, Y, Z) in physical inches
+            - depth_inch: Euclidean distance || P - C || in physical inches (0.0 if camera center unknown)
+    """
+    u = float(pixel_u)
+    v = float(pixel_v)
+    z_target = float(elevation_inch)
+
+    # 1. Preferred method: 3D ray intersection with horizontal plane
+    if rvec is not None and tvec is not None and camera_matrix is not None:
+        R, _ = cv2.Rodrigues(rvec)
+        C = camera_center if camera_center is not None else (-R.T @ tvec).ravel().astype(np.float64)
+        K_inv = np.linalg.inv(camera_matrix)
+        p_cam = K_inv @ np.array([u, v, 1.0], dtype=np.float64)
+        d_world = (R.T @ p_cam).ravel()
+
+        if abs(d_world[2]) > 1e-9:
+            lam = (z_target - C[2]) / d_world[2]
+            P = C + lam * d_world
+            X, Y, Z = float(P[0]), float(P[1]), z_target
+            depth = float(np.linalg.norm(P - C))
+            return (X, Y, Z), depth
+
+    # 2. Fallback method: floor homography inversion
+    if h_floor is not None:
+        H_inv = np.linalg.inv(h_floor)
+        p = np.array([u, v, 1.0], dtype=np.float64)
+        P = H_inv @ p
+        z_div = P[2] if abs(P[2]) > 1e-12 else 1e-12
+        X = float(P[0] / z_div)
+        Y = float(P[1] / z_div)
+        Z = z_target
+        depth = 0.0
+        if camera_center is not None:
+            depth = float(np.linalg.norm(np.array([X, Y, Z]) - camera_center))
+        return (X, Y, Z), depth
+
+    return (u, v, z_target), 0.0
+
+
+def project_pixels_to_field_3d_batch(
+    pixel_coords: np.ndarray,
+    elevation_inch: float = 0.0,
+    rvec: Optional[np.ndarray] = None,
+    tvec: Optional[np.ndarray] = None,
+    camera_matrix: Optional[np.ndarray] = None,
+    camera_center: Optional[np.ndarray] = None,
+    h_floor: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Vectorized batch projection of 2D pixel coordinates (N, 2) to 3D field coordinates (N, 3)
+    and Euclidean depth values (N,).
+    """
+    pts = np.asarray(pixel_coords, dtype=np.float64)
+    if pts.ndim == 1:
+        pts = pts.reshape(1, 2)
+    n = len(pts)
+    if n == 0:
+        return np.zeros((0, 3), dtype=np.float64), np.zeros(0, dtype=np.float64)
+
+    coords_3d = np.zeros((n, 3), dtype=np.float64)
+    depths = np.zeros(n, dtype=np.float64)
+
+    for i in range(n):
+        c, d = project_pixel_to_field_3d(
+            pixel_u=pts[i, 0],
+            pixel_v=pts[i, 1],
+            elevation_inch=elevation_inch,
+            rvec=rvec,
+            tvec=tvec,
+            camera_matrix=camera_matrix,
+            camera_center=camera_center,
+            h_floor=h_floor,
+        )
+        coords_3d[i] = c
+        depths[i] = d
+
+    return coords_3d, depths
 
 
 def compute_cmc_affine_detailed(
@@ -424,18 +672,21 @@ class HomographyActor(HomographyActorBase):
         top_dets = [d for d in detections if d.center_px[1] <= 0.65 * h_frame]
         effective_dets = top_dets if len(top_dets) >= 4 else detections
 
-        # Extract 2D point correspondences: field (X, Y) <-> image (u, v)
+        # Extract 2D and 3D point correspondences: field (X, Y, Z) <-> image (u, v)
         field_pts_list: List[Tuple[float, float]] = []
         image_pts_list: List[Tuple[float, float]] = []
+        field_pts_3d_list: List[Tuple[float, float, float]] = []
 
         for det in effective_dets:
             field_pts_list.append((det.field_coords_inch[0], det.field_coords_inch[1]))
             image_pts_list.append((det.center_px[0], det.center_px[1]))
+            field_pts_3d_list.append(det.field_coords_inch)
 
         n_pts = len(field_pts_list)
         if n_pts >= 4:
             field_pts = np.array(field_pts_list, dtype=np.float64)
             image_pts = np.array(image_pts_list, dtype=np.float64)
+            field_pts_3d = np.array(field_pts_3d_list, dtype=np.float64)
 
             # RANSAC outlier filtering for >= 5 correspondences to eliminate spurious tag fits
             if n_pts >= 5:
@@ -446,34 +697,73 @@ class HomographyActor(HomographyActorBase):
                     inliers = inlier_mask.ravel() == 1
                     field_pts = field_pts[inliers]
                     image_pts = image_pts[inliers]
+                    field_pts_3d = field_pts_3d[inliers]
 
             # Step 1: Normalized DLT
             H_init, dlt_cond = compute_normalized_dlt(field_pts, image_pts)
 
             # Step 2: Levenberg-Marquardt Non-Linear Optimization
-            H_opt, lm_rmse, lm_iters, converged = optimize_homography_lm(
+            H_lm, lm_rmse, lm_iters, lm_converged = optimize_homography_lm(
                 H_init, field_pts, image_pts
             )
 
-            # Step 3: Camera Cut Detection
+            # Step 3: Perspective-n-Point (PnP) 3D Camera Pose & Ground Plane Estimation
+            w_frame = frame.image_bgr.shape[1] if (frame.image_bgr is not None and frame.image_bgr.size > 0) else 1920
+            try:
+                rvec_pnp, tvec_pnp, cam_center, H_floor, pnp_rmse, f_pnp, pnp_success = estimate_camera_pose_pnp(
+                    object_points_3d=field_pts_3d,
+                    image_points_2d=image_pts,
+                    image_shape=(h_frame, w_frame),
+                )
+            except Exception as e:
+                logger.debug("PnP estimation error: %s", e)
+                pnp_success = False
+                rvec_pnp, tvec_pnp, cam_center, H_floor, pnp_rmse, f_pnp = None, None, None, None, 999.0, None
+
+            # Select PnP floor homography if valid and well-conditioned with low RMSE (< 2.5 px)
+            if pnp_success and (pnp_rmse < 2.5 or (not lm_converged and pnp_rmse < 5.0)):
+                H_opt = H_floor
+                final_rmse = pnp_rmse
+                converged = True
+            else:
+                H_opt = H_lm
+                final_rmse = lm_rmse
+                converged = lm_converged
+
+            # Step 4: Camera Cut Detection
             is_cut = detect_camera_cut(
                 curr_h=H_opt,
                 prev_h=prev_h,
-                curr_rmse=lm_rmse,
+                curr_rmse=final_rmse,
                 prev_rmse=prev_rmse,
                 tracking_breakdown=tracking_breakdown,
             )
+
+            # Compute Euclidean distance from camera optical center to each visible tag
+            visible_tag_ids = [int(d.tag_id) for d in effective_dets]
+            tag_distances: Dict[int, float] = {}
+            if pnp_success and cam_center is not None:
+                for det in effective_dets:
+                    p_tag = np.array(det.field_coords_inch, dtype=np.float64)
+                    dist = float(np.linalg.norm(p_tag - cam_center))
+                    tag_distances[int(det.tag_id)] = dist
 
             estimate = HomographyEstimate(
                 frame_index=frame.metadata.frame_index,
                 timestamp_ms=frame.metadata.pts_ms,
                 h_matrix=H_opt,
                 dlt_condition=dlt_cond,
-                lm_rmse=lm_rmse,
+                lm_rmse=final_rmse,
                 lm_iterations=lm_iters,
                 converged=converged,
                 camera_cut=is_cut,
                 affine_cmc=cmc_affine,
+                camera_pose_rvec=rvec_pnp if pnp_success else None,
+                camera_pose_tvec=tvec_pnp if pnp_success else None,
+                camera_center=cam_center if pnp_success else None,
+                focal_length=f_pnp if pnp_success else None,
+                visible_tags=visible_tag_ids,
+                tag_distances=tag_distances,
             )
         else:
             # Fewer than 4 point correspondences: fallback or propagate with CMC
@@ -492,7 +782,7 @@ class HomographyActor(HomographyActorBase):
                 dlt_cond = 1.0
                 lm_rmse = 999.0
 
-
+            vis_tags = [int(d.tag_id) for d in effective_dets] if effective_dets else []
             estimate = HomographyEstimate(
                 frame_index=frame.metadata.frame_index,
                 timestamp_ms=frame.metadata.pts_ms,
@@ -503,6 +793,8 @@ class HomographyActor(HomographyActorBase):
                 converged=False,
                 camera_cut=is_cut,
                 affine_cmc=cmc_affine,
+                visible_tags=vis_tags,
+                tag_distances={},
             )
 
         # Update actor state
@@ -568,6 +860,33 @@ class HomographyActor(HomographyActorBase):
         x = float(P[0] / P[2])
         y = float(P[1] / P[2])
         return (x, y)
+
+    async def project_pixel_to_field_3d(
+        self,
+        pixel_coords: Tuple[float, float],
+        homography: HomographyEstimate,
+        elevation_inch: float = 0.0,
+    ) -> Tuple[Tuple[float, float, float], float]:
+        """
+        Transforms 2D pixel coordinates (u, v) into physical 3D field coordinates (X, Y, Z) in inches
+        at the specified elevation Z = elevation_inch, and computes Euclidean distance (depth) from camera.
+        """
+        u, v = float(pixel_coords[0]), float(pixel_coords[1])
+        cam_matrix = None
+        if homography.focal_length is not None:
+            f = homography.focal_length
+            cam_matrix = np.array([[f, 0.0, 960.0], [0.0, f, 540.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+        return project_pixel_to_field_3d(
+            pixel_u=u,
+            pixel_v=v,
+            elevation_inch=elevation_inch,
+            rvec=homography.camera_pose_rvec,
+            tvec=homography.camera_pose_tvec,
+            camera_matrix=cam_matrix,
+            camera_center=homography.camera_center,
+            h_floor=homography.h_matrix,
+        )
 
     async def compute_camera_motion_compensation(
         self,

@@ -33,7 +33,10 @@ from src.vision.homography import (
     compute_cmc_affine_detailed,
     compute_normalized_dlt,
     detect_camera_cut,
+    estimate_camera_pose_pnp,
     optimize_homography_lm,
+    project_pixel_to_field_3d,
+    project_pixels_to_field_3d_batch,
     project_pixels_to_field_batch,
 )
 
@@ -513,3 +516,154 @@ async def test_split_screen_apriltag_isolation() -> None:
     est = await actor.estimate_homography(frame, detections=all_dets)
     assert est.converged is True
     assert est.h_matrix is not None
+
+
+# ============================================================================
+# 8. Perspective-n-Point (PnP) 3D Camera Pose & Ground Plane Estimation Tests
+# ============================================================================
+
+
+def test_estimate_camera_pose_pnp_and_floor_homography() -> None:
+    """
+    Verifies that estimate_camera_pose_pnp recovers true 3D camera pose (R, T, C)
+    and floor homography H_floor mapping carpet Z=0 plane to image pixels.
+    Uses canonical 32 AprilTag CAD coordinates from field.glb (specifically Tags 2, 11 on Red Hub).
+    """
+    # Elevated broadcast sideline camera at (325.6, 520.0, 160.0) looking at field center (325.6, 158.85, 0.0)
+    cam_pos_true = np.array([325.6, 520.0, 160.0], dtype=np.float64)
+    look_at = np.array([325.6, 158.85, 0.0], dtype=np.float64)
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    forward = look_at - cam_pos_true
+    forward /= np.linalg.norm(forward)
+    right = np.cross(forward, up)
+    right /= np.linalg.norm(right)
+    true_up = np.cross(right, forward)
+
+    R_true = np.vstack([right, -true_up, forward])
+    t_true = -R_true @ cam_pos_true
+    rvec_true, _ = cv2.Rodrigues(R_true)
+    tvec_true = t_true.reshape(3, 1)
+
+    f_true = 1450.0
+    K_true = np.array([[f_true, 0.0, 960.0], [0.0, f_true, 540.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    # Subset of 3D tags including Tag 2 and Tag 11 on Red Hub
+    tag_ids = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 17, 18, 21, 24]
+    tags_3d = np.array([CANONICAL_FIELD_TAGS[tid] for tid in tag_ids], dtype=np.float64)
+
+    proj_clean, _ = cv2.projectPoints(tags_3d, rvec_true, tvec_true, K_true, None)
+    img_pts_clean = proj_clean.reshape(-1, 2)
+
+    rvec_est, tvec_est, cam_center_est, H_floor, rmse, f_est, success = estimate_camera_pose_pnp(
+        object_points_3d=tags_3d,
+        image_points_2d=img_pts_clean,
+        camera_matrix=K_true,
+        image_shape=(1080, 1920),
+    )
+
+    assert success is True
+    assert rmse < 1e-4, f"PnP RMSE {rmse} px must be near zero on clean points"
+
+    # Camera optical center recovery error < 0.1 inches
+    cam_pos_err = np.linalg.norm(cam_center_est - cam_pos_true)
+    assert cam_pos_err < 0.1, f"Camera center error {cam_pos_err} in exceeds 0.1 in"
+
+    # Verify Floor Homography H_floor on ground carpet points (Z=0)
+    carpet_points_3d = np.array([
+        [100.0, 100.0, 0.0],
+        [325.6, 158.85, 0.0],
+        [500.0, 200.0, 0.0],
+        [200.0, 250.0, 0.0],
+    ], dtype=np.float64)
+
+    proj_carpet, _ = cv2.projectPoints(carpet_points_3d, rvec_true, tvec_true, K_true, None)
+    img_carpet = proj_carpet.reshape(-1, 2)
+
+    # Unproject carpet points using H_floor
+    H_inv = np.linalg.inv(H_floor)
+    for i in range(len(carpet_points_3d)):
+        u, v = img_carpet[i]
+        p_hom = H_inv @ np.array([u, v, 1.0])
+        unproj_xy = p_hom[:2] / p_hom[2]
+        err_xy = np.linalg.norm(unproj_xy - carpet_points_3d[i, :2])
+        assert err_xy < 0.1, f"Floor homography unprojection error {err_xy} in exceeds 0.1 in"
+
+
+# ============================================================================
+# 9. 3D Ray Depth Projection Tests (5.91" FUEL Ball & Robot Ground Patch)
+# ============================================================================
+
+
+def test_project_pixel_to_field_3d_fuel_and_robot() -> None:
+    """
+    Verifies 3D ray projection to horizontal planes and Euclidean depth extraction:
+    1. Carpet ground patch at Z = 0.0 inches (robot bottom center contact)
+    2. FUEL game piece center at Z = 2.955 inches (5.91" diameter sphere)
+    3. Verifies Euclidean depth || P - C || matches ground truth within 0.01 inches.
+    """
+    cam_pos = np.array([325.6, 520.0, 160.0], dtype=np.float64)
+    look_at = np.array([325.6, 158.85, 0.0], dtype=np.float64)
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    forward = look_at - cam_pos
+    forward /= np.linalg.norm(forward)
+    right = np.cross(forward, up)
+    right /= np.linalg.norm(right)
+    true_up = np.cross(right, forward)
+
+    R = np.vstack([right, -true_up, forward])
+    t = -R @ cam_pos
+    rvec, _ = cv2.Rodrigues(R)
+    tvec = t.reshape(3, 1)
+    K = np.array([[1250.0, 0.0, 960.0], [0.0, 1250.0, 540.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    # 1. Robot ground contact patch at (X=250.0, Y=180.0, Z=0.0)
+    robot_ground_pt = np.array([250.0, 180.0, 0.0], dtype=np.float64)
+    proj_r, _ = cv2.projectPoints(robot_ground_pt.reshape(1, 3), rvec, tvec, K, None)
+    u_r, v_r = proj_r[0, 0]
+
+    coords_r, depth_r = project_pixel_to_field_3d(
+        pixel_u=u_r,
+        pixel_v=v_r,
+        elevation_inch=0.0,
+        rvec=rvec,
+        tvec=tvec,
+        camera_matrix=K,
+        camera_center=cam_pos,
+    )
+    assert np.linalg.norm(np.array(coords_r) - robot_ground_pt) < 0.01
+    true_robot_depth = float(np.linalg.norm(robot_ground_pt - cam_pos))
+    assert abs(depth_r - true_robot_depth) < 0.01
+
+    # 2. FUEL game piece (5.91" diameter => radius = 2.955") at (X=300.0, Y=220.0, Z=2.955)
+    fuel_center_pt = np.array([300.0, 220.0, 2.955], dtype=np.float64)
+    proj_f, _ = cv2.projectPoints(fuel_center_pt.reshape(1, 3), rvec, tvec, K, None)
+    u_f, v_f = proj_f[0, 0]
+
+    coords_f, depth_f = project_pixel_to_field_3d(
+        pixel_u=u_f,
+        pixel_v=v_f,
+        elevation_inch=2.955,
+        rvec=rvec,
+        tvec=tvec,
+        camera_matrix=K,
+        camera_center=cam_pos,
+    )
+    assert np.linalg.norm(np.array(coords_f) - fuel_center_pt) < 0.01
+    true_fuel_depth = float(np.linalg.norm(fuel_center_pt - cam_pos))
+    assert abs(depth_f - true_fuel_depth) < 0.01
+
+    # 3. Batch projection test
+    coords_batch, depths_batch = project_pixels_to_field_3d_batch(
+        pixel_coords=np.array([[u_r, v_r], [u_f, v_f]]),
+        elevation_inch=0.0,
+        rvec=rvec,
+        tvec=tvec,
+        camera_matrix=K,
+        camera_center=cam_pos,
+    )
+    assert len(coords_batch) == 2
+    assert len(depths_batch) == 2
+    assert abs(depths_batch[0] - true_robot_depth) < 0.01
+

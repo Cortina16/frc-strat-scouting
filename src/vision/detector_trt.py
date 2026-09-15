@@ -390,20 +390,24 @@ class RobotBumperVerificationGate:
     def __init__(
         self,
         min_bumper_score: float = 0.10,
+        min_superstructure_score: float = 0.08,
         max_robots_total: int = 6,
         max_robots_per_alliance: int = 3,
         min_aspect_ratio: float = 0.40,
         max_aspect_ratio: float = 2.60,
         upper_mask_fraction: float = 0.12,
         field_bounds: Optional[Tuple[float, float, float, float]] = None,
+        hub_exclusion_radius_inch: float = 30.0,
     ) -> None:
         self.min_bumper_score = min_bumper_score
+        self.min_superstructure_score = min_superstructure_score
         self.max_robots_total = max_robots_total
         self.max_robots_per_alliance = max_robots_per_alliance
         self.min_aspect_ratio = min_aspect_ratio
         self.max_aspect_ratio = max_aspect_ratio
         self.upper_mask_fraction = upper_mask_fraction
         self.field_bounds = field_bounds
+        self.hub_exclusion_radius_inch = hub_exclusion_radius_inch
 
     def evaluate_bumper_patch(
         self,
@@ -437,14 +441,69 @@ class RobotBumperVerificationGate:
         alliance = "RED" if score_red > score_blue else ("BLUE" if score_blue > score_red else "UNKNOWN")
         return bumper_score, alliance
 
+    def evaluate_superstructure_patch(
+        self,
+        superstructure_crop: np.ndarray,
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        Evaluates mechanical superstructure complexity in the upper 65-75% of candidate box.
+        FRC robots have mechanical elevators, vertical tubing, intake rollers, gearboxes,
+        wiring, and sponsor Lexan that create high edge gradient density and texture variance,
+        distinct from flat arena walls, carpet floor, or smooth plastic Hub chutes.
+
+        Returns:
+            Tuple of (superstructure_score, metrics_dict).
+        """
+        if superstructure_crop.size == 0 or superstructure_crop.shape[0] < 3 or superstructure_crop.shape[1] < 3:
+            return 0.50, {"edge_variance": 50.0, "superstructure_score": 0.50}
+
+        gray = cv2.cvtColor(superstructure_crop, cv2.COLOR_BGR2GRAY)
+
+        # 1. Edge gradient variance via Laplacian
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        edge_variance = float(laplacian.var())
+
+        # 2. Structural gradient energy via Sobel
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+        grad_mean = float(np.mean(grad_mag))
+
+        # 3. Check for illegal all-bumper coloring (e.g. solid Hub plastic chutes or colored banners)
+        # FRC robots can only have bumper fabric in the bottom 5 inches; the superstructure is aluminum/lexan/polycarb.
+        hsv_super = cv2.cvtColor(superstructure_crop, cv2.COLOR_BGR2HSV)
+        h_s, s_s, v_s = hsv_super[:, :, 0], hsv_super[:, :, 1], hsv_super[:, :, 2]
+        solid_red = ((h_s <= 15) | (h_s >= 165)) & (s_s >= 55) & (v_s >= 40)
+        solid_blue = (h_s >= 95) & (h_s <= 135) & (s_s >= 55) & (v_s >= 40)
+        excessive_fabric_color = float(max(np.mean(solid_red), np.mean(solid_blue)))
+
+        # Normalized superstructure score: penalize excessive fabric color (indicative of Hub/wall)
+        score_var = float(np.clip(edge_variance / 80.0, 0.0, 1.0))
+        score_grad = float(np.clip(grad_mean / 25.0, 0.0, 1.0))
+        fabric_penalty = max(0.0, (excessive_fabric_color - 0.40) * 2.0)
+
+        super_score = float(np.clip(0.60 * score_var + 0.40 * score_grad - fabric_penalty, 0.0, 1.0))
+        metrics = {
+            "edge_variance": edge_variance,
+            "gradient_mean": grad_mean,
+            "excessive_fabric_color": excessive_fabric_color,
+            "superstructure_score": super_score,
+        }
+        return super_score, metrics
+
     def verify_candidates(
         self,
         frame_bgr: np.ndarray,
         candidates: List[BoundingBox],
         field_bounds: Optional[Tuple[float, float, float, float]] = None,
+        homography: Optional[Any] = None,
     ) -> List[BoundingBox]:
         """
         Filters and validates candidate bounding boxes, returning verified FRC robot bounding boxes.
+        Enforces:
+        - Bumper fabric presence in bottom 30-35%
+        - Mechanical superstructure presence in upper 65-70%
+        - Hub physical collision / exclusion gating (rejecting detections inside the solid Hub base)
         """
         if not candidates:
             return []
@@ -453,6 +512,9 @@ class RobotBumperVerificationGate:
 
         h_img, w_img = frame_bgr.shape[:2]
         verified_candidates: List[Tuple[BoundingBox, float, str]] = []
+
+        h_mat = getattr(homography, "h_matrix", None) if homography is not None else None
+        h_inv = np.linalg.inv(h_mat) if (h_mat is not None and np.linalg.det(h_mat) != 0) else None
 
         for box in candidates:
             cx = float(box.center_x)
@@ -491,7 +553,21 @@ class RobotBumperVerificationGate:
                 if not (min_x_px <= cx <= max_x_px and min_y_px <= cy <= max_y_px):
                     continue
 
-            # 5. Bumper crop extraction from bottom 35%
+            # 5. Hub Physical Exclusion Gating (if homography is provided)
+            # Red Hub at (162.8, 158.85), Blue Hub at (488.4, 158.85)
+            if h_inv is not None:
+                contact_v = cy + 0.5 * h
+                p_hom = h_inv @ np.array([cx, contact_v, 1.0], dtype=np.float64)
+                if abs(p_hom[2]) > 1e-6:
+                    fx = p_hom[0] / p_hom[2]
+                    fy = p_hom[1] / p_hom[2]
+                    dist_red = np.hypot(fx - 162.8, fy - 158.85)
+                    dist_blue = np.hypot(fx - 488.4, fy - 158.85)
+                    if dist_red < self.hub_exclusion_radius_inch or dist_blue < self.hub_exclusion_radius_inch:
+                        # Geometrically inside solid Hub cylinder - reject Hub false positive!
+                        continue
+
+            # 6. Bumper and Superstructure crop extraction
             x1 = max(0, int(round(cx - w / 2.0)))
             y1 = max(0, int(round(cy - h / 2.0)))
             x2 = min(w_img, int(round(cx + w / 2.0)))
@@ -500,12 +576,14 @@ class RobotBumperVerificationGate:
                 continue
 
             box_crop = frame_bgr[y1:y2, x1:x2]
-            bumper_h = max(4, int(round(box_crop.shape[0] * 0.35)))
+            bumper_h = max(4, int(round(box_crop.shape[0] * 0.30)))
             bumper_crop = box_crop[box_crop.shape[0] - bumper_h :, :]
+            superstructure_crop = box_crop[: box_crop.shape[0] - bumper_h, :]
 
             bumper_score, alliance = self.evaluate_bumper_patch(bumper_crop)
+            super_score, _ = self.evaluate_superstructure_patch(superstructure_crop)
 
-            # Multi-region bumper search: if bottom 35% has low bumper presence,
+            # Multi-region bumper search: if bottom 30% has low bumper presence,
             # evaluate the full box crop (bumper may be higher up or partially occluded by balls)
             if bumper_score < self.min_bumper_score:
                 full_score, full_alliance = self.evaluate_bumper_patch(box_crop)
@@ -520,19 +598,21 @@ class RobotBumperVerificationGate:
             yellow_ball_mask = (r_ch > 120.0) & (g_ch > 120.0) & (b_ch < 100.0)
             has_yellow_balls = float(np.mean(yellow_ball_mask)) >= 0.06
 
-            # Occlusion-resilient validation:
-            # 1. Authentic bumper fabric detected in bottom patch or full crop (score >= min_bumper_score)
-            # 2. Bumper is occluded by yellow fuel balls, but detector confidence is >= 0.30
-            req_score = 0.08 if conf >= 0.70 else self.min_bumper_score
+            # Dual-verification:
+            # 1. Authentic bumper fabric detected (score >= min_bumper_score)
+            # 2. Authentic mechanical superstructure detected or balls occluding (super_score >= min_superstructure_score)
+            req_bumper_score = 0.08 if conf >= 0.70 else self.min_bumper_score
+            req_super_score = 0.05 if conf >= 0.70 else self.min_superstructure_score
+
             is_valid_robot = (
-                (bumper_score >= req_score)
+                (bumper_score >= req_bumper_score and (super_score >= req_super_score or has_yellow_balls))
                 or (has_yellow_balls and conf >= 0.30)
             )
             if not is_valid_robot:
                 continue
 
-            # Boost/calibrate confidence with bumper score
-            if bumper_score >= req_score:
+            # Boost/calibrate confidence with bumper & superstructure score
+            if bumper_score >= req_bumper_score:
                 final_conf = float(np.clip(0.70 * conf + 0.30 * min(1.0, bumper_score * 2.5), 0.0, 1.0))
             else:
                 final_conf = conf

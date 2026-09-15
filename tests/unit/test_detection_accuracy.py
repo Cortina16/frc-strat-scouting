@@ -343,8 +343,8 @@ async def test_detector_with_real_weights_if_present() -> None:
     If data/models/medium_robo_v3.pt is present on disk, tests loading and inference.
     """
     weights_path = "data/models/medium_robo_v3.pt"
-    if not os.path.isfile(weights_path):
-        pytest.skip(f"Model weights not found at {weights_path}")
+    if not os.path.isfile(weights_path) or os.path.getsize(weights_path) < 10000:
+        pytest.skip(f"Model weights not found or Git-LFS pointer at {weights_path}")
 
     gate = RobotBumperVerificationGate(min_bumper_score=0.10)
     actor = TensorRTDetectorActor(bumper_gate=gate)

@@ -104,6 +104,7 @@ async def run_pipeline(
     detector_engine_path: Optional[str] = None,
     red_teams: Optional[Sequence[int]] = None,
     blue_teams: Optional[Sequence[int]] = None,
+    render_video: bool = False,
 ) -> Dict[str, Any]:
     """
     Executes the end-to-end scouting pipeline lifecycle.
@@ -201,6 +202,25 @@ async def run_pipeline(
             print(f"  Matched Events: {sample_asof.get('event_count', 0)}")
         except Exception as q_err:
             logger.warning("Could not execute sample ASOF query for team %s: %s", t_num, q_err)
+
+    if render_video and os.path.exists(stream_uri):
+        try:
+            logger.info("\n[Annotated Video] Rendering match video overlay for %s...", match_id)
+            from src.render import render_annotated_video
+            out_v_name = f"annotated_match_{match_id}.mp4"
+            out_v_path = os.path.join(export_dir or "data/parquet", out_v_name)
+            target_traj = os.path.join(export_dir or "data/parquet", f"match_{match_id}_trajectories.parquet")
+            traj_input = target_traj if os.path.exists(target_traj) else (export_dir or "data/parquet")
+            render_annotated_video(
+                video_path=stream_uri,
+                parquet_path=traj_input,
+                output_path=out_v_path,
+                max_frames=max_frames,
+            )
+            print(f"[Annotated Video] Successfully exported: {out_v_path}")
+            summary["annotated_video_path"] = out_v_path
+        except Exception as r_err:
+            logger.warning("Could not render annotated video: %s", r_err)
 
     return summary
 
@@ -319,6 +339,11 @@ def parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
         help="Comma-separated list of Blue alliance team numbers (e.g. 868,2046,2910).",
     )
     parser.add_argument(
+        "--render-video",
+        action="store_true",
+        help="Automatically render annotated video overlaying robot tracking and balls upon completion.",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -334,6 +359,9 @@ def main(args: Optional[list[str]] = None) -> None:
     if raw_args and raw_args[0] == "render":
         from src.render import main as render_main
         sys.exit(render_main(raw_args[1:]))
+    if raw_args and raw_args[0] == "web":
+        from src.server.__main__ import main as server_main
+        sys.exit(server_main(raw_args[1:]))
 
     args_parsed = parse_args(raw_args)
     setup_logging(args_parsed.log_level)
@@ -376,6 +404,7 @@ def main(args: Optional[list[str]] = None) -> None:
                 detector_engine_path=detector_weights,
                 red_teams=red_teams,
                 blue_teams=blue_teams,
+                render_video=args_parsed.render_video,
             )
         )
     finally:

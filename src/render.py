@@ -63,14 +63,23 @@ def resolve_parquet_paths(parquet_arg: str) -> Tuple[str, Optional[str]]:
                 traj_candidates = [all_parquets[0]]
 
         if traj_candidates:
+            traj_candidates.sort(key=os.path.getmtime, reverse=True)
             traj_path = traj_candidates[0]
 
-        # Search directory for actions parquet
-        act_candidates = glob.glob(os.path.join(parquet_arg, "*actions*.parquet"))
-        if not act_candidates:
-            act_candidates = glob.glob(os.path.join(parquet_arg, "action_events.parquet"))
-        if act_candidates:
-            actions_path = act_candidates[0]
+        # Check for companion actions file corresponding to selected trajectories file
+        if traj_path and "_trajectories.parquet" in traj_path:
+            companion_act = traj_path.replace("_trajectories.parquet", "_actions.parquet")
+            if os.path.isfile(companion_act):
+                actions_path = companion_act
+
+        if not actions_path:
+            # Search directory for actions parquet
+            act_candidates = glob.glob(os.path.join(parquet_arg, "*actions*.parquet"))
+            if not act_candidates:
+                act_candidates = glob.glob(os.path.join(parquet_arg, "action_events.parquet"))
+            if act_candidates:
+                act_candidates.sort(key=os.path.getmtime, reverse=True)
+                actions_path = act_candidates[0]
 
     elif os.path.isfile(parquet_arg):
         traj_path = parquet_arg
@@ -266,25 +275,41 @@ def draw_ball_annotations(
             r = min(14, max(3, int(round(b.get("pixel_radius", 5.0)))))
             state = str(b.get("ball_state", "ON_CARPET"))
 
-            if state == "IN_FLIGHT":
+            fz = float(b.get("field_z_inch", 2.955) or 2.955)
+            if state == "IN_FLIGHT" or fz > 4.5:
                 # Cyan for in-flight projectile balls
                 color = (255, 255, 0)
                 thickness = 2
+                cv2.circle(frame, (cx, cy), r, color, thickness, lineType=cv2.LINE_AA)
+                cv2.circle(frame, (cx, cy), 2, (255, 255, 255), -1)
+                cv2.putText(
+                    frame,
+                    f"Z:{fz:.0f}\"",
+                    (cx + r + 2, cy + 3),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35,
+                    (255, 255, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
             elif state == "INTAKED":
                 # Vivid orange for intaked / robot-occluded balls
                 color = (0, 140, 255)
                 thickness = 1
+                cv2.circle(frame, (cx, cy), r, color, thickness, lineType=cv2.LINE_AA)
+                cv2.circle(frame, (cx, cy), 1, (0, 0, 255), -1)
             elif state == "LOST":
                 # Amber for momentarily coasting occluded balls
                 color = (0, 190, 230)
                 thickness = 1
+                cv2.circle(frame, (cx, cy), r, color, thickness, lineType=cv2.LINE_AA)
+                cv2.circle(frame, (cx, cy), 1, (0, 0, 255), -1)
             else:
                 # Bright yellow-gold for carpet balls
                 color = (0, 230, 255)
                 thickness = 1
-
-            cv2.circle(frame, (cx, cy), r, color, thickness, lineType=cv2.LINE_AA)
-            cv2.circle(frame, (cx, cy), 1, (0, 0, 255), -1)
+                cv2.circle(frame, (cx, cy), r, color, thickness, lineType=cv2.LINE_AA)
+                cv2.circle(frame, (cx, cy), 1, (0, 0, 255), -1)
 
 
 def draw_hud(
@@ -511,17 +536,19 @@ def render_annotated_video(
     )
 
     balls_file = None
-    if os.path.isdir(parquet_path):
-        cands = glob.glob(os.path.join(parquet_path, "*balls*.parquet"))
-        if cands:
-            balls_file = cands[0]
-    elif os.path.isfile(parquet_arg := parquet_path):
-        dir_name = os.path.dirname(os.path.abspath(parquet_arg))
-        if "_trajectories.parquet" in parquet_arg:
-            c = parquet_arg.replace("_trajectories.parquet", "_balls.parquet")
-            if os.path.isfile(c):
-                balls_file = c
-        if not balls_file:
+    if traj_file and "_trajectories.parquet" in traj_file:
+        companion_balls = traj_file.replace("_trajectories.parquet", "_balls.parquet")
+        if os.path.isfile(companion_balls):
+            balls_file = companion_balls
+
+    if not balls_file:
+        if os.path.isdir(parquet_path):
+            cands = glob.glob(os.path.join(parquet_path, "*balls*.parquet"))
+            if cands:
+                cands.sort(key=os.path.getmtime, reverse=True)
+                balls_file = cands[0]
+        elif os.path.isfile(parquet_arg := parquet_path):
+            dir_name = os.path.dirname(os.path.abspath(parquet_arg))
             c = os.path.join(dir_name, "ball_trajectories.parquet")
             if os.path.isfile(c):
                 balls_file = c
