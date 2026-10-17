@@ -263,18 +263,21 @@ def estimate_camera_pose_pnp(
                 [0.0, f_candidate, cy],
                 [0.0, 0.0, 1.0],
             ], dtype=np.float64)
-            ok, r_tmp, t_tmp = cv2.solvePnP(
-                obj_pts, img_pts, K_cand, None, flags=cv2.SOLVEPNP_ITERATIVE
-            )
-            if not ok:
-                return 1e6
             try:
-                r_tmp, t_tmp = cv2.solvePnPRefineLM(obj_pts, img_pts, K_cand, None, r_tmp, t_tmp)
+                ok, r_tmp, t_tmp = cv2.solvePnP(
+                    obj_pts, img_pts, K_cand, None, flags=cv2.SOLVEPNP_ITERATIVE
+                )
+                if not ok:
+                    return 1e6
+                try:
+                    r_tmp, t_tmp = cv2.solvePnPRefineLM(obj_pts, img_pts, K_cand, None, r_tmp, t_tmp)
+                except Exception:
+                    pass
+                p_cand, _ = cv2.projectPoints(obj_pts, r_tmp, t_tmp, K_cand, None)
+                res = p_cand.reshape(-1, 2) - img_pts
+                return float(np.sqrt(np.mean(np.sum(res**2, axis=1))))
             except Exception:
-                pass
-            p_cand, _ = cv2.projectPoints(obj_pts, r_tmp, t_tmp, K_cand, None)
-            res = p_cand.reshape(-1, 2) - img_pts
-            return float(np.sqrt(np.mean(np.sum(res**2, axis=1))))
+                return 1e6
 
         f_low = max(400.0 * scale, 300.0)
         f_high = min(3500.0 * scale, 4000.0)
@@ -297,31 +300,48 @@ def estimate_camera_pose_pnp(
             [0.0, 0.0, 1.0],
         ], dtype=np.float64)
 
-    # Solve PnP with RANSAC for >= 5 points, or standard iterative for 4 points
+    # Solve PnP with RANSAC for >= 5 points, or standard iterative/IPPE for 4 points
+    ok: bool = False
+    rvec: Optional[np.ndarray] = None
+    tvec: Optional[np.ndarray] = None
+
     if n_pts >= 5:
-        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
-            obj_pts,
-            img_pts,
-            K,
-            None,
-            flags=cv2.SOLVEPNP_ITERATIVE,
-            reprojectionError=8.0,
-            iterationsCount=1000,
-        )
-        if ok and inliers is not None and len(inliers) >= 4:
-            obj_inliers = obj_pts[inliers.ravel()]
-            img_inliers = img_pts[inliers.ravel()]
-            try:
-                rvec, tvec = cv2.solvePnPRefineLM(obj_inliers, img_inliers, K, None, rvec, tvec)
-            except Exception:
-                pass
+        try:
+            ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+                obj_pts,
+                img_pts,
+                K,
+                None,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+                reprojectionError=8.0,
+                iterationsCount=1000,
+            )
+            if ok and inliers is not None and len(inliers) >= 4:
+                obj_inliers = obj_pts[inliers.ravel()]
+                img_inliers = img_pts[inliers.ravel()]
+                try:
+                    rvec, tvec = cv2.solvePnPRefineLM(obj_inliers, img_inliers, K, None, rvec, tvec)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug("solvePnPRansac failed: %s", e)
+            ok = False
+            rvec, tvec = None, None
     else:
-        ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, None, flags=cv2.SOLVEPNP_ITERATIVE)
-        if ok:
+        # For 4 points, first attempt SOLVEPNP_ITERATIVE; if it fails (e.g. coplanar points), attempt SOLVEPNP_IPPE
+        for flag in [cv2.SOLVEPNP_ITERATIVE, cv2.SOLVEPNP_IPPE]:
             try:
-                rvec, tvec = cv2.solvePnPRefineLM(obj_pts, img_pts, K, None, rvec, tvec)
-            except Exception:
-                pass
+                ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, None, flags=flag)
+                if ok and rvec is not None and tvec is not None:
+                    try:
+                        rvec, tvec = cv2.solvePnPRefineLM(obj_pts, img_pts, K, None, rvec, tvec)
+                    except Exception:
+                        pass
+                    break
+            except Exception as e:
+                logger.debug("solvePnP flag %s failed: %s", flag, e)
+                ok = False
+                rvec, tvec = None, None
 
     if not ok or rvec is None or tvec is None:
         return (
@@ -348,7 +368,9 @@ def estimate_camera_pose_pnp(
     proj_pts, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, None)
     errs = proj_pts.reshape(-1, 2) - img_pts
     rmse = float(np.sqrt(np.mean(np.sum(errs**2, axis=1))))
-    success = bool(rmse < 10.0 and abs(H_floor[2, 2]) > 1e-6)
+    
+    cond_h = float(np.linalg.cond(H_floor)) if np.all(np.isfinite(H_floor)) else 1e9
+    success = bool(rmse < 15.0 and abs(H_floor[2, 2]) > 1e-6 and cond_h < 1e8)
 
     return rvec, tvec, camera_center, H_floor, rmse, f_val, success
 
@@ -672,6 +694,14 @@ class HomographyActor(HomographyActorBase):
         top_dets = [d for d in detections if d.center_px[1] <= 0.65 * h_frame]
         effective_dets = top_dets if len(top_dets) >= 4 else detections
 
+        # Deduplicate detections by tag_id, favoring upper/wide-angle detections
+        tag_det_map: dict[int, TagDetectionResult] = {}
+        for det in effective_dets:
+            tid = int(det.tag_id)
+            if tid not in tag_det_map or det.center_px[1] < tag_det_map[tid].center_px[1]:
+                tag_det_map[tid] = det
+        effective_dets = list(tag_det_map.values())
+
         # Extract 2D and 3D point correspondences: field (X, Y, Z) <-> image (u, v)
         field_pts_list: List[Tuple[float, float]] = []
         image_pts_list: List[Tuple[float, float]] = []
@@ -720,24 +750,55 @@ class HomographyActor(HomographyActorBase):
                 pnp_success = False
                 rvec_pnp, tvec_pnp, cam_center, H_floor, pnp_rmse, f_pnp = None, None, None, None, 999.0, None
 
-            # Select PnP floor homography if valid and well-conditioned with low RMSE (< 2.5 px)
-            if pnp_success and (pnp_rmse < 2.5 or (not lm_converged and pnp_rmse < 5.0)):
-                H_opt = H_floor
-                final_rmse = pnp_rmse
-                converged = True
-            else:
-                H_opt = H_lm
-                final_rmse = lm_rmse
-                converged = lm_converged
+            has_elevated_tags = bool(np.any(field_pts_3d[:, 2] > 1.0))
+
+            # Candidate homography from current frame observations
+            H_candidate = H_floor if (pnp_success and pnp_rmse < 25.0 and H_floor is not None) else H_lm
+            candidate_rmse = pnp_rmse if (pnp_success and pnp_rmse < 25.0) else lm_rmse
 
             # Step 4: Camera Cut Detection
             is_cut = detect_camera_cut(
-                curr_h=H_opt,
+                curr_h=H_candidate,
                 prev_h=prev_h,
-                curr_rmse=final_rmse,
+                curr_rmse=candidate_rmse,
                 prev_rmse=prev_rmse,
                 tracking_breakdown=tracking_breakdown,
             )
+
+            if is_cut:
+                # Camera cut detected! Adopt new camera perspective
+                H_opt = H_candidate
+                final_rmse = candidate_rmse
+                converged = bool(pnp_success or lm_converged)
+            elif pnp_success and pnp_rmse < 15.0 and H_floor is not None:
+                H_opt = H_floor
+                final_rmse = pnp_rmse
+                converged = True
+            elif has_elevated_tags and prev_h is not None and prev_est is not None:
+                # STRICT FALLBACK: When tracking continuous video and PnP fails on elevated anchors
+                # (e.g. collinear anchors, occlusion, or parallax vortex breakdown), NEVER fall back
+                # to corrupted 2D Hub/Wall coordinate fitting! Strictly propagate via CMC affine optical flow.
+                logger.warning(
+                    "PnP failed on elevated AprilTags (RMSE=%.2f, success=%s). "
+                    "Strictly propagating via CMC / cached homography to prevent Z-parallax explosion.",
+                    pnp_rmse, pnp_success,
+                )
+                A_3x3 = np.vstack([cmc_affine, [0.0, 0.0, 1.0]])
+                propagated_h = A_3x3 @ prev_h
+                if abs(propagated_h[2, 2]) > 1e-12:
+                    propagated_h /= propagated_h[2, 2]
+                H_opt = propagated_h
+                final_rmse = prev_est.lm_rmse
+                converged = False
+            elif lm_converged and lm_rmse < 5.0:
+                # Uninitialized frame (prev_h is None) or planar fixture with low LM RMSE
+                H_opt = H_lm
+                final_rmse = lm_rmse
+                converged = lm_converged
+            else:
+                H_opt = np.eye(3, dtype=np.float64)
+                final_rmse = 999.0
+                converged = False
 
             # Compute Euclidean distance from camera optical center to each visible tag
             visible_tag_ids = [int(d.tag_id) for d in effective_dets]

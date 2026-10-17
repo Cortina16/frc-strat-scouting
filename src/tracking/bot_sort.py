@@ -226,6 +226,8 @@ class STrack:
         embedding: Optional[np.ndarray] = None,
         frame_index: int = 0,
         alpha_reid: float = 0.9,
+        red_roster: Optional[Sequence[int]] = None,
+        blue_roster: Optional[Sequence[int]] = None,
     ) -> None:
         self.track_id = track_id
         self.state = TrackState.TRACKED
@@ -257,6 +259,9 @@ class STrack:
         self.ocr_team_votes: Dict[int, float] = {}
         self.ocr_alliance_votes: Dict[AllianceColor, float] = {}
         self.best_ocr_conf: float = 0.0
+        self.red_roster: Optional[List[int]] = [int(x) for x in red_roster] if red_roster is not None else None
+        self.blue_roster: Optional[List[int]] = [int(x) for x in blue_roster] if blue_roster is not None else None
+        self.mandatory_attribution: bool = False
 
         # Physical field coordinates and kinematics
         self.field_x_inch: float = 0.0
@@ -393,19 +398,40 @@ class STrack:
         self.state = TrackState.BRIDGED
 
     def update_ocr(self, ocr: Optional[OCRResult]) -> None:
-        """Maintains running weighted consensus for team number and alliance."""
+        """Maintains running weighted consensus for team number and alliance with strict alliance purity."""
         if ocr is None or ocr.confidence <= 0.0:
             return
 
         conf = float(ocr.confidence)
 
+        # Alliance Purity Guardrail:
+        # A Red robot CANNOT have a Blue team number, and a Blue robot CANNOT have a Red team number.
         if ocr.team_number is not None:
-            self.ocr_team_votes[ocr.team_number] = self.ocr_team_votes.get(ocr.team_number, 0.0) + conf
-            self.team_number = max(self.ocr_team_votes, key=self.ocr_team_votes.get)
+            team_val = int(ocr.team_number)
+            if self.alliance == AllianceColor.RED and self.blue_roster and team_val in self.blue_roster:
+                logger.debug("Alliance Purity: rejected blue team %d on red track %d", team_val, self.track_id)
+            elif self.alliance == AllianceColor.BLUE and self.red_roster and team_val in self.red_roster:
+                logger.debug("Alliance Purity: rejected red team %d on blue track %d", team_val, self.track_id)
+            else:
+                self.ocr_team_votes[team_val] = self.ocr_team_votes.get(team_val, 0.0) + conf
+                valid_votes = {
+                    t: v for t, v in self.ocr_team_votes.items()
+                    if not (self.alliance == AllianceColor.RED and self.blue_roster and t in self.blue_roster)
+                    and not (self.alliance == AllianceColor.BLUE and self.red_roster and t in self.red_roster)
+                }
+                if valid_votes:
+                    self.team_number = max(valid_votes, key=valid_votes.get)
 
         if ocr.alliance and ocr.alliance != AllianceColor.UNKNOWN and not self.is_alliance_locked:
             self.ocr_alliance_votes[ocr.alliance] = self.ocr_alliance_votes.get(ocr.alliance, 0.0) + conf
             self.alliance = max(self.ocr_alliance_votes, key=self.ocr_alliance_votes.get)
+
+        # Infer alliance from verified team number if alliance was unknown
+        if self.alliance == AllianceColor.UNKNOWN and self.team_number is not None:
+            if self.red_roster and self.team_number in self.red_roster:
+                self.alliance = AllianceColor.RED
+            elif self.blue_roster and self.team_number in self.blue_roster:
+                self.alliance = AllianceColor.BLUE
 
         if conf > self.best_ocr_conf:
             self.best_ocr_conf = conf
@@ -417,6 +443,7 @@ class STrack:
         frame_index: int = 0,
         target_fps: float = 60.0,
         homography_estimate: Optional[HomographyEstimate] = None,
+        is_autonomous: bool = False,
     ) -> None:
         """
         Projects robot ground contact patch (bounding box bottom center) into field CAD coordinates
@@ -488,6 +515,20 @@ class STrack:
         new_x = float(np.clip(new_x, 10.0, 641.2))
         new_y = float(np.clip(new_y, 10.0, 307.7))
 
+        # Autonomous Phase Centerline Crossing Restriction
+        # Under FRC rules, a robot cannot cross 100% over the center line (X = 325.6") during AUTO.
+        # Red side: X <= 325.6", Blue side: X >= 325.6".
+        if is_autonomous:
+            if self.alliance == AllianceColor.RED and new_x > 335.0:
+                new_x = 325.6
+            elif self.alliance == AllianceColor.BLUE and new_x < 315.0:
+                new_x = 325.6
+            elif self.alliance == AllianceColor.UNKNOWN:
+                if new_x < 315.0:
+                    self.alliance = AllianceColor.RED
+                elif new_x > 335.0:
+                    self.alliance = AllianceColor.BLUE
+
         self.field_z_inch = 0.0  # Robot carpet contact elevation
 
         # Field-center relative coordinates (Center = 325.6, 158.85, 0.0)
@@ -558,6 +599,19 @@ class STrack:
     def to_robot_tracklet_state(self) -> RobotTrackletState:
         """Converts internal track state to public DTO RobotTrackletState."""
         t_num = self.team_number if self.team_number is not None else self.confirmed_team_number
+        # Strict Alliance Purity Guardrail
+        if self.alliance == AllianceColor.RED and self.blue_roster and t_num in self.blue_roster:
+            t_num = None
+        elif self.alliance == AllianceColor.BLUE and self.red_roster and t_num in self.red_roster:
+            t_num = None
+
+        # Mandatory attribution fallback: ensure non-null team number if alliance roster is known
+        if self.mandatory_attribution and t_num is None:
+            if self.alliance == AllianceColor.RED and self.red_roster:
+                t_num = self.red_roster[self.track_id % len(self.red_roster)]
+            elif self.alliance == AllianceColor.BLUE and self.blue_roster:
+                t_num = self.blue_roster[self.track_id % len(self.blue_roster)]
+
         return RobotTrackletState(
             track_id=self.track_id,
             team_number=t_num,
@@ -600,6 +654,7 @@ class BoTSORT:
         target_fps: float = 60.0,
         red_teams: Optional[Sequence[int]] = None,
         blue_teams: Optional[Sequence[int]] = None,
+        mandatory_attribution: bool = False,
     ) -> None:
         self.track_high_thresh = track_high_thresh
         self.track_low_thresh = track_low_thresh
@@ -611,6 +666,7 @@ class BoTSORT:
         self.max_lost_frames = max_lost_frames
         self.max_coast_frames = max_coast_frames
         self.target_fps = target_fps
+        self.mandatory_attribution = mandatory_attribution
 
         self.red_teams: Optional[List[int]] = [int(t) for t in red_teams] if red_teams is not None else None
         self.blue_teams: Optional[List[int]] = [int(t) for t in blue_teams] if blue_teams is not None else None
@@ -629,6 +685,9 @@ class BoTSORT:
         """Sets the alliance roster for bipartite team number matching."""
         self.red_teams = [int(t) for t in red_teams] if red_teams is not None else None
         self.blue_teams = [int(t) for t in blue_teams] if blue_teams is not None else None
+        for t in self.tracked_tracks + self.lost_tracks:
+            t.red_roster = self.red_teams
+            t.blue_roster = self.blue_teams
 
     def update(
         self,
@@ -637,6 +696,7 @@ class BoTSORT:
         ocr_results: Optional[Sequence[Optional[OCRResult]]],
         homography: Optional[HomographyEstimate],
         frame_index: int,
+        is_autonomous: bool = False,
     ) -> List[RobotTrackletState]:
         """
         Processes a single frame of detections and updates active robot tracks.
@@ -823,7 +883,10 @@ class BoTSORT:
                     bbox=det,
                     embedding=emb,
                     frame_index=frame_index,
+                    red_roster=self.red_teams,
+                    blue_roster=self.blue_teams,
                 )
+                new_track.mandatory_attribution = self.mandatory_attribution
                 self._next_id += 1
                 if ocr_results is not None and orig_idx < len(ocr_results):
                     new_track.update_ocr(ocr_results[orig_idx])
@@ -865,6 +928,7 @@ class BoTSORT:
                 frame_index=frame_index,
                 target_fps=self.target_fps,
                 homography_estimate=homography,
+                is_autonomous=is_autonomous,
             )
 
         # 8. Reconcile team assignments across alliances via bipartite matching
@@ -876,7 +940,8 @@ class BoTSORT:
         """
         Applies Bayesian bipartite matching via linear sum assignment to assign unique
         candidate team numbers to active tracks on each alliance.
-        Guarantees that no two robots on the same alliance share the same team number.
+        Guarantees that no two robots on the same alliance share the same team number,
+        and enforces mandatory team attribution from the roster.
         """
         if not self.red_teams and not self.blue_teams:
             return
@@ -888,17 +953,23 @@ class BoTSORT:
             if not candidate_teams:
                 continue
 
-            # Check for tracks that might belong to this alliance based on team votes
+            # Check for tracks that might belong to this alliance based on team votes or field position
             for track in self.tracked_tracks:
                 if track.is_alliance_locked:
                     continue
-                if track.alliance == AllianceColor.UNKNOWN and track.ocr_team_votes:
-                    red_v = sum(track.ocr_team_votes.get(t, 0.0) for t in (self.red_teams or []))
-                    blue_v = sum(track.ocr_team_votes.get(t, 0.0) for t in (self.blue_teams or []))
-                    if alliance == AllianceColor.RED and red_v > 0 and red_v >= blue_v:
-                        track.alliance = AllianceColor.RED
-                    elif alliance == AllianceColor.BLUE and blue_v > 0 and blue_v > red_v:
-                        track.alliance = AllianceColor.BLUE
+                if track.alliance == AllianceColor.UNKNOWN:
+                    if track.ocr_team_votes:
+                        red_v = sum(track.ocr_team_votes.get(t, 0.0) for t in (self.red_teams or []))
+                        blue_v = sum(track.ocr_team_votes.get(t, 0.0) for t in (self.blue_teams or []))
+                        if alliance == AllianceColor.RED and red_v > 0 and red_v >= blue_v:
+                            track.alliance = AllianceColor.RED
+                        elif alliance == AllianceColor.BLUE and blue_v > 0 and blue_v > red_v:
+                            track.alliance = AllianceColor.BLUE
+                    elif track.has_field_coords and track.field_x_inch > 0:
+                        if alliance == AllianceColor.RED and track.field_x_inch < 325.6:
+                            track.alliance = AllianceColor.RED
+                        elif alliance == AllianceColor.BLUE and track.field_x_inch >= 325.6:
+                            track.alliance = AllianceColor.BLUE
 
             alliance_tracks = [t for t in self.tracked_tracks if t.alliance == alliance]
             if not alliance_tracks:
@@ -915,33 +986,35 @@ class BoTSORT:
             row_ind, col_ind = linear_sum_assignment(cost_matrix)
             assigned_track_indices = set()
 
+            assigned_teams: Set[int] = set()
             for r, c in zip(row_ind, col_ind):
                 assigned_track_indices.add(r)
                 tr = alliance_tracks[r]
                 if cost_matrix[r, c] < 0.0:
                     matched_team = candidate_teams[c]
                     tr.team_number = matched_team
+                    assigned_teams.add(matched_team)
                     if tr.ocr_team_votes.get(matched_team, 0.0) >= 0.50:
                         tr.alliance = alliance
                         tr.is_alliance_locked = True
                         tr.confirmed_team_number = matched_team
                         tr.is_team_locked = True
-                elif tr.is_team_locked and tr.confirmed_team_number is not None:
+                elif tr.is_team_locked and tr.confirmed_team_number is not None and tr.confirmed_team_number not in assigned_teams:
                     tr.team_number = tr.confirmed_team_number
+                    assigned_teams.add(tr.confirmed_team_number)
                 else:
                     tr.team_number = None
 
             for i in range(num_tracks):
                 if i not in assigned_track_indices:
                     tr = alliance_tracks[i]
-                    if tr.is_team_locked and tr.confirmed_team_number is not None:
+                    if tr.is_team_locked and tr.confirmed_team_number is not None and tr.confirmed_team_number not in assigned_teams:
                         tr.team_number = tr.confirmed_team_number
+                        assigned_teams.add(tr.confirmed_team_number)
                     else:
                         tr.team_number = None
 
-            # Deductive Elimination Inference:
-            # When active tracks on an alliance have verified team assignments and exactly one candidate team
-            # remains unassigned, deduce the missing team for any persistent unassigned track on that alliance.
+            # Deductive Elimination & Mandatory Team Attribution:
             assigned_teams = {t.team_number for t in alliance_tracks if t.team_number is not None}
             unassigned_candidates = [tm for tm in candidate_teams if tm not in assigned_teams]
             unassigned_tracks = [t for t in alliance_tracks if t.team_number is None]
@@ -956,6 +1029,20 @@ class BoTSORT:
                 target_track.is_alliance_locked = True
                 target_track.ocr_team_votes[deduced_team] = max(target_track.ocr_team_votes.get(deduced_team, 0.0), 0.80)
                 logger.debug("Deduced team %d for track %d on alliance %s by elimination", deduced_team, target_track.track_id, alliance.value)
+            elif self.mandatory_attribution and unassigned_tracks and unassigned_candidates:
+                for tr in unassigned_tracks:
+                    if not unassigned_candidates:
+                        break
+                    # If track previously had a team number that is available, restore it!
+                    if tr.confirmed_team_number in unassigned_candidates:
+                        assigned_tm = tr.confirmed_team_number
+                        unassigned_candidates.remove(assigned_tm)
+                    else:
+                        assigned_tm = unassigned_candidates.pop(0)
+                    tr.team_number = assigned_tm
+                    tr.confirmed_team_number = assigned_tm
+                    tr.alliance = alliance
+                    logger.debug("Mandatory attribution: attributed team %d to track %d on alliance %s", assigned_tm, tr.track_id, alliance.value)
 
 
 class TrackingActor(TrackingActorBase):
@@ -978,6 +1065,7 @@ class TrackingActor(TrackingActorBase):
         max_coast_frames: int = 0,
         red_teams: Optional[Sequence[int]] = None,
         blue_teams: Optional[Sequence[int]] = None,
+        mandatory_attribution: bool = False,
     ) -> None:
         self.target_fps = target_fps
         self.reid_extractor = reid_extractor or ReIDExtractor()
@@ -993,6 +1081,7 @@ class TrackingActor(TrackingActorBase):
             target_fps=target_fps,
             red_teams=red_teams,
             blue_teams=blue_teams,
+            mandatory_attribution=mandatory_attribution,
         )
 
     def set_roster(
@@ -1011,6 +1100,7 @@ class TrackingActor(TrackingActorBase):
         homography: HomographyEstimate,
         frame_bgr: np.ndarray,
         embeddings: Optional[Sequence[np.ndarray]] = None,
+        is_autonomous: Optional[bool] = None,
     ) -> List[RobotTrackletState]:
         """
         Updates Kalman filters with CMC, extracts ReID embeddings, and bridges lost tracks.
@@ -1022,6 +1112,7 @@ class TrackingActor(TrackingActorBase):
             homography: HomographyEstimate containing h_matrix and affine_cmc.
             frame_bgr: Raw video frame tensor (H, W, 3) uint8 or dummy array.
             embeddings: Optional pre-extracted 512-D normalized ReID embeddings (for testing/bypass).
+            is_autonomous: Optional flag indicating autonomous period. If None, inferred from metadata.
 
         Returns:
             List of RobotTrackletState objects representing active robot trajectories.
@@ -1035,12 +1126,18 @@ class TrackingActor(TrackingActorBase):
         else:
             embs = list(embeddings)
 
+        is_auto = is_autonomous if is_autonomous is not None else (
+            (homography is not None and homography.timestamp_ms is not None and homography.timestamp_ms <= 15000)
+            or frame_index < 900
+        )
+
         track_states = self.tracker.update(
             detections=detections,
             embeddings=embs,
             ocr_results=ocr_results,
             homography=homography,
             frame_index=frame_index,
+            is_autonomous=is_auto,
         )
 
         return track_states
@@ -1112,6 +1209,7 @@ class TrackingActor(TrackingActorBase):
         ocr_batch: Optional[List[List[OCRResult]]] = None,
         homographies: Optional[List[HomographyEstimate]] = None,
         frames: Optional[List[np.ndarray]] = None,
+        is_autonomous: Optional[bool] = None,
     ) -> List[List[RobotTrackletState]]:
         """
         Updates multi-object tracks for a batch of consecutive frames in a single call.
@@ -1126,6 +1224,7 @@ class TrackingActor(TrackingActorBase):
             ocr_batch: Optional list of OCRResult lists for each frame.
             homographies: Optional list of HomographyEstimates.
             frames: Optional list of BGR frame numpy arrays.
+            is_autonomous: Optional autonomous flag.
 
         Returns:
             List of RobotTrackletState lists corresponding to each frame in the batch.
@@ -1150,6 +1249,7 @@ class TrackingActor(TrackingActorBase):
                     ocr_results=ocr_res,
                     homography=h_est,  # type: ignore[arg-type]
                     frame_bgr=frame_bgr,
+                    is_autonomous=is_autonomous,
                 )
 
                 if h_est is not None and not h_est.camera_cut:
@@ -1173,6 +1273,7 @@ class TrackingActor(TrackingActorBase):
                     homography=hom,
                     frame_bgr=frame_bgr,
                     embeddings=embs,
+                    is_autonomous=is_autonomous,
                 )
                 batch_results.append(states)
 

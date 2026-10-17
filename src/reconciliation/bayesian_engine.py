@@ -27,6 +27,7 @@ from src.common.interfaces import ReconciliationActorBase, ReconciliationActorPr
 from src.common.types import (
     ActionSegment,
     ActionType,
+    AllianceColor,
     FieldAPIScoreState,
     FieldElement,
     MatchStage,
@@ -274,6 +275,18 @@ def compute_spatial_likelihood(
 
     if pos is None:
         pos = (0.0, 0.0)
+
+    # Autonomous Centerline Crossing Check:
+    # Under FRC rules, a robot cannot cross 100% over the center line (X = 325.6") during AUTO (t <= 15s / frame < 900).
+    # Red actions at X > 335.0" and Blue actions at X < 315.0" receive spatial likelihood 0.0.
+    if isinstance(target, ActionSegment):
+        is_auto = bool(target.start_time_ms <= 15000 or (target.start_frame is not None and target.start_frame < 900))
+        if is_auto:
+            target_al = getattr(target, "alliance", None)
+            if (element in (FieldElement.RED_HUB, FieldElement.RED_TOWER, FieldElement.RED_OUTPOST, FieldElement.RED_CORRAL) or target_al == AllianceColor.RED) and pos[0] > 335.0:
+                return 0.0
+            if (element in (FieldElement.BLUE_HUB, FieldElement.BLUE_TOWER, FieldElement.BLUE_OUTPOST, FieldElement.BLUE_CORRAL) or target_al == AllianceColor.BLUE) and pos[0] < 315.0:
+                return 0.0
 
     # 1. Hub scoring
     if element in (FieldElement.RED_HUB, FieldElement.BLUE_HUB) or action_type == ActionType.SCORE_HUB:

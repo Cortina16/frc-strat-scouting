@@ -563,6 +563,64 @@ def get_template_bank() -> DigitTemplateBank:
     return _GLOBAL_TEMPLATE_BANK
 
 
+def direct_roster_template_match(
+    crop_bgr: np.ndarray,
+    candidate_teams: Sequence[int],
+    alliance: AllianceColor = AllianceColor.UNKNOWN,
+) -> Tuple[Optional[int], float]:
+    """
+    Direct multi-scale roster template correlation on bumper crops.
+    Matches full number strings directly against HSV differential text maps
+    without requiring fragile single-digit segmentation.
+    """
+    if crop_bgr is None or crop_bgr.size == 0 or not candidate_teams:
+        return None, 0.0
+
+    # Build text map: combine HSV V - S differential and channel minimum
+    text_map = np.min(crop_bgr, axis=2)
+    try:
+        hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+        _, s_c, v_c = cv2.split(hsv)
+        diff = np.clip(v_c.astype(np.float32) - s_c.astype(np.float32), 0, 255).astype(np.uint8)
+        if np.max(diff) > 40:
+            text_map = cv2.addWeighted(text_map, 0.4, diff, 0.6, 0)
+    except Exception:
+        pass
+
+    crop_h, crop_w = text_map.shape[:2]
+    if crop_h < 12 or crop_w < 20:
+        return None, 0.0
+
+    nominal_scale = (crop_h * 0.50) / 22.0
+    best_team: Optional[int] = None
+    best_score: float = -1.0
+
+    for team in candidate_teams:
+        t_str = str(team)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        for factor in [0.85, 1.0, 1.15]:
+            scale = nominal_scale * factor
+            (tw, th), _ = cv2.getTextSize(t_str, font, scale, 2)
+            if (tw + 6) >= crop_w or (th + 6) >= crop_h or tw < 8 or th < 8:
+                continue
+            tmpl = np.zeros((th + 6, tw + 6), dtype=np.uint8)
+            cv2.putText(tmpl, t_str, (3, th + 3), font, scale, 255, 2, cv2.LINE_AA)
+            if tmpl.shape[0] >= text_map.shape[0] or tmpl.shape[1] >= text_map.shape[1]:
+                continue
+            try:
+                res = cv2.matchTemplate(text_map, tmpl, cv2.TM_CCOEFF_NORMED)
+                sc = float(np.max(res))
+                if sc > best_score:
+                    best_score = sc
+                    best_team = team
+            except Exception:
+                continue
+
+    if best_team is not None and best_score >= 0.50:
+        return best_team, float(np.clip(best_score, 0.0, 1.0))
+    return None, 0.0
+
+
 def extract_digit_candidates(
     crop_bgr: np.ndarray,
     alliance: AllianceColor,
@@ -592,6 +650,16 @@ def extract_digit_candidates(
     elif alliance == AllianceColor.BLUE:
         channel_boost = crop_bgr[:, :, 2]
         text_map = np.maximum(text_map, channel_boost)
+
+    # HSV (V - S) differential text mapping: zeros out colored fabric background
+    try:
+        hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+        _, s_c, v_c = cv2.split(hsv)
+        v_s_diff = np.clip(v_c.astype(np.float32) - s_c.astype(np.float32), 0, 255).astype(np.uint8)
+        if np.max(v_s_diff) > 40:
+            text_map = cv2.addWeighted(text_map, 0.5, v_s_diff, 0.5, 0)
+    except Exception:
+        pass
 
     # Check if wide horizontal glare streak exists across the crop (e.g. pool noodle curvature highlight)
     _, bin_temp = cv2.threshold(text_map, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -790,6 +858,13 @@ def recognize_team_number(
                 if final_sc > best_score:
                     best_score = final_sc
                     best_team = matched_team
+
+        # If contour-based OCR did not yield a high-confidence roster match, try direct template correlation
+        if best_team is None or best_score < 0.65:
+            dt_team, dt_score = direct_roster_template_match(crop_bgr, candidate_teams, alliance)
+            if dt_team is not None and dt_score > best_score:
+                best_team = dt_team
+                best_score = dt_score
 
         if best_team is not None and best_score >= 0.40:
             return best_team, float(np.clip(best_score, 0.0, 1.0))
@@ -1021,48 +1096,56 @@ class OCREnhancerActor(OCREnhancerActorBase):
             digits_list = recognized_per_crop[idx]
             al = alliances[idx]
             al_conf = alliance_confs[idx]
-
-            if not digits_list:
-                results[idx] = OCRResult(
-                    team_number=None,
-                    alliance=al,
-                    confidence=float(al_conf * 0.5),
-                    super_resolved=True,
-                )
-                continue
-
-            digits_list.sort(key=lambda item: item[0])
-            num_str = "".join(item[1] for item in digits_list)
-            conf_scores = [item[2] for item in digits_list]
-            ocr_conf = float(np.mean(conf_scores))
+            enhanced_crop = enhanced_crops[idx]
 
             candidate_teams = self._roster.get(al, [])
-            if candidate_teams:
-                matched_team, match_sc, _ = match_candidate_teams(num_str, candidate_teams)
-                if matched_team is not None:
-                    team_num = matched_team
-                    final_conf = float(np.clip(match_sc * (0.5 + 0.5 * ocr_conf), 0.0, 1.0))
+            opposing_teams = self._roster.get(AllianceColor.BLUE if al == AllianceColor.RED else AllianceColor.RED, [])
+
+            team_num: Optional[int] = None
+            final_conf: float = 0.0
+
+            if digits_list:
+                digits_list.sort(key=lambda item: item[0])
+                num_str = "".join(item[1] for item in digits_list)
+                conf_scores = [item[2] for item in digits_list]
+                ocr_conf = float(np.mean(conf_scores))
+
+                if candidate_teams:
+                    matched_team, match_sc, _ = match_candidate_teams(num_str, candidate_teams)
+                    if matched_team is not None:
+                        team_num = matched_team
+                        final_conf = float(np.clip(match_sc * (0.5 + 0.5 * ocr_conf), 0.0, 1.0))
                 else:
-                    team_num = None
-                    final_conf = float(al_conf * 0.5)
-            else:
-                try:
-                    t_val = int(num_str)
-                    if 1 <= t_val <= 99999 and len(num_str) <= 5:
-                        team_num = t_val
-                        final_conf = float(
-                            np.clip(
-                                ocr_conf * (0.6 + 0.4 * al_conf),
-                                0.0,
-                                1.0,
+                    try:
+                        t_val = int(num_str)
+                        if 1 <= t_val <= 99999 and len(num_str) <= 5:
+                            team_num = t_val
+                            final_conf = float(
+                                np.clip(
+                                    ocr_conf * (0.6 + 0.4 * al_conf),
+                                    0.0,
+                                    1.0,
+                                )
                             )
-                        )
-                    else:
-                        team_num = None
-                        final_conf = float(al_conf * 0.5)
-                except ValueError:
-                    team_num = None
-                    final_conf = float(al_conf * 0.5)
+                    except ValueError:
+                        pass
+
+            # If no team found from digit contours, evaluate direct roster template correlation
+            if team_num is None and candidate_teams:
+                dt_team, dt_sc = direct_roster_template_match(enhanced_crop, candidate_teams, al)
+                if dt_team is not None:
+                    team_num = dt_team
+                    final_conf = float(np.clip(dt_sc * (0.6 + 0.4 * al_conf), 0.0, 1.0))
+
+            # Strict Alliance Purity Guardrail:
+            # Under no circumstances can a Red robot detection have a Blue team number,
+            # or a Blue robot detection have a Red team number!
+            if team_num is not None and opposing_teams and team_num in opposing_teams:
+                team_num = None
+                final_conf = float(al_conf * 0.5)
+
+            if team_num is None and final_conf == 0.0:
+                final_conf = float(al_conf * 0.5)
 
             results[idx] = OCRResult(
                 team_number=team_num,

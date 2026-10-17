@@ -409,6 +409,13 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                 self.mqtt_broker_url,
                 self.mqtt_port,
             )
+            await call_actor(
+                self.actors.publisher,
+                "connect",
+                "loopback",
+                self.mqtt_port,
+                f"{self.mqtt_client_id}-{match_id}",
+            )
 
         # 4. Initialize stream ingestion
         stream_ready = await call_actor(
@@ -690,6 +697,7 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                     target_frames = frame_refs if (frame_refs is not None and self.use_ray) else batch
 
                     # Batched tracking call: 1 RPC instead of 16-24 individual RPCs
+                    is_auto = any((f.metadata.pts_ms <= 15000) or (f.metadata.frame_index < 900) for f in batch)
                     if hasattr(actors.tracking, "update_tracks_batch"):
                         frame_indices = [f.metadata.frame_index for f in batch]
                         detections_batch = [det.boxes for det in det_results]
@@ -701,6 +709,7 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                             per_frame_ocr,
                             estimates,
                             target_frames,
+                            is_autonomous=is_auto,
                         )
                     else:
                         batch_active_tracks = []
@@ -974,7 +983,19 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                                 self._total_trajectories_inserted += len(active_tracks)
 
                         # Write ball trajectories if present
-                        if hasattr(actors.storage, "insert_ball_trajectories") and batch_ball_tracks:
+                        if hasattr(actors.storage, "insert_multi_frame_ball_batch") and batch_ball_tracks:
+                            frame_balls = [
+                                (batch_ball_tracks[i], batch[i].metadata.frame_index)
+                                for i in range(len(batch))
+                                if i < len(batch_ball_tracks) and batch_ball_tracks[i]
+                            ]
+                            if frame_balls:
+                                await call_actor(
+                                    actors.storage,
+                                    "insert_multi_frame_ball_batch",
+                                    frame_balls,
+                                )
+                        elif hasattr(actors.storage, "insert_ball_trajectories") and batch_ball_tracks:
                             for i, frame in enumerate(batch):
                                 b_states = batch_ball_tracks[i] if i < len(batch_ball_tracks) else []
                                 if b_states:
@@ -1417,6 +1438,7 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
         target_frames = frame_refs if (frame_refs is not None and self.use_ray) else batch
 
         # 1. Batched tracking (1 RPC)
+        is_auto = any((f.metadata.pts_ms <= 15000) or (f.metadata.frame_index < 900) for f in batch)
         if hasattr(self.actors.tracking, "update_tracks_batch"):
             frame_indices = [f.metadata.frame_index for f in batch]
             detections_batch = [det.boxes for det in det_results]
@@ -1428,6 +1450,7 @@ class PipelineOrchestrator(PipelineOrchestratorProtocol):
                 per_frame_ocr,
                 estimates,
                 target_frames,
+                is_autonomous=is_auto,
             )
         else:
             batch_active_tracks = []

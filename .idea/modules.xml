@@ -2,7 +2,8 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/FRC_scouting.iml" filepath="$PROJECT_DIR$/.idea/FRC_scouting.iml" />
+      <module fileurl="file://$USER_HOME$/snap/antigravity-cli/common/.gemini/antigravity-cli/brain/8f3e43ce-2536-4cea-8d63-790f79788a35/.idea/8f3e43ce-2536-4cea-8d63-790f79788a35.iml" filepath="$USER_HOME$/snap/antigravity-cli/common/.gemini/antigravity-cli/brain/8f3e43ce-2536-4cea-8d63-790f79788a35/.idea/8f3e43ce-2536-4cea-8d63-790f79788a35.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/frc-scouting.iml" filepath="$PROJECT_DIR$/.idea/frc-scouting.iml" />
     </modules>
   </component>
 </project>

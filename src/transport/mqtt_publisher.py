@@ -1077,6 +1077,24 @@ class MQTTTelemetryPublisherActor(TelemetryPublisherActorBase):
             logger.error("Exception publishing live trajectory: %s", err)
             return False
 
+    async def publish_live_trajectories_batch(
+        self,
+        topic: str,
+        trajectory_frames: List[Any],
+        qos: int = 0,
+        wrap_envelope: Optional[bool] = None,
+    ) -> int:
+        """Publishes a batch of live trajectory frames, returning count of successfully published packets."""
+        if not self.is_connected:
+            return 0
+        success_count = 0
+        for frame in trajectory_frames:
+            ok = await self.publish_live_trajectory(topic, frame, qos=qos, wrap_envelope=wrap_envelope)
+            if ok:
+                success_count += 1
+        return success_count
+
+
     async def publish_duckdb_sync(
         self,
         topic: str,

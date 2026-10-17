@@ -317,7 +317,15 @@ def parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--detector-weights", "--model",
         type=str,
-        default="data/models/medium_robo_v3.pt" if os.path.isfile("data/models/medium_robo_v3.pt") else None,
+        default=(
+            "yolo11x_robot_best.pt"
+            if os.path.isfile("yolo11x_robot_best.pt")
+            else (
+                "data/models/einstein_raw_v1.pt"
+                if os.path.isfile("data/models/einstein_raw_v1.pt")
+                else ("data/models/medium_robo_v3.pt" if os.path.isfile("data/models/medium_robo_v3.pt") else None)
+            )
+        ),
         help="Path to FRC robot detection model weights (.pt, .onnx, .engine).",
     )
     parser.add_argument(

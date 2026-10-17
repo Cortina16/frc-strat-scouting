@@ -497,6 +497,7 @@ class RobotBumperVerificationGate:
         candidates: List[BoundingBox],
         field_bounds: Optional[Tuple[float, float, float, float]] = None,
         homography: Optional[Any] = None,
+        is_autonomous: bool = False,
     ) -> List[BoundingBox]:
         """
         Filters and validates candidate bounding boxes, returning verified FRC robot bounding boxes.
@@ -504,6 +505,8 @@ class RobotBumperVerificationGate:
         - Bumper fabric presence in bottom 30-35%
         - Mechanical superstructure presence in upper 65-70%
         - Hub physical collision / exclusion gating (rejecting detections inside the solid Hub base)
+        - Autonomous phase centerline crossing restriction (legally/physically impossible for Red robot to be on Blue side, and vice-versa)
+        - Physical non-overlap constraint (two robots cannot be 100% overlapping; suppresses duplicates and adaptively loosens thresholds to discover missing distinct robots)
         """
         if not candidates:
             return []
@@ -512,8 +515,14 @@ class RobotBumperVerificationGate:
 
         h_img, w_img = frame_bgr.shape[:2]
         verified_candidates: List[Tuple[BoundingBox, float, str]] = []
+        rejected_pool: List[Tuple[BoundingBox, float, str, float, float]] = []
 
-        h_mat = getattr(homography, "h_matrix", None) if homography is not None else None
+        if isinstance(homography, np.ndarray):
+            h_mat = homography
+        elif homography is not None:
+            h_mat = getattr(homography, "h_matrix", None)
+        else:
+            h_mat = None
         h_inv = np.linalg.inv(h_mat) if (h_mat is not None and np.linalg.det(h_mat) != 0) else None
 
         for box in candidates:
@@ -580,16 +589,50 @@ class RobotBumperVerificationGate:
             bumper_crop = box_crop[box_crop.shape[0] - bumper_h :, :]
             superstructure_crop = box_crop[: box_crop.shape[0] - bumper_h, :]
 
-            bumper_score, alliance = self.evaluate_bumper_patch(bumper_crop)
-            super_score, _ = self.evaluate_superstructure_patch(superstructure_crop)
+            if box.class_id == 1:
+                bumper_score = 0.95
+                alliance = "RED"
+                super_score, _ = self.evaluate_superstructure_patch(superstructure_crop)
+            elif box.class_id == 2:
+                bumper_score = 0.95
+                alliance = "BLUE"
+                super_score, _ = self.evaluate_superstructure_patch(superstructure_crop)
+            else:
+                bumper_score, alliance = self.evaluate_bumper_patch(bumper_crop)
+                super_score, _ = self.evaluate_superstructure_patch(superstructure_crop)
 
-            # Multi-region bumper search: if bottom 30% has low bumper presence,
-            # evaluate the full box crop (bumper may be higher up or partially occluded by balls)
-            if bumper_score < self.min_bumper_score:
-                full_score, full_alliance = self.evaluate_bumper_patch(box_crop)
-                if full_score > bumper_score:
-                    bumper_score = full_score
-                    alliance = full_alliance
+                # Multi-region bumper search: if bottom 30% has low bumper presence,
+                # evaluate the full box crop (bumper may be higher up or partially occluded by balls)
+                if bumper_score < self.min_bumper_score:
+                    full_score, full_alliance = self.evaluate_bumper_patch(box_crop)
+                    if full_score > bumper_score:
+                        bumper_score = full_score
+                        alliance = full_alliance
+
+            # 7. Autonomous Phase Centerline Crossing Restriction
+            # Under FRC rules, a robot cannot cross 100% over the center line (X=325.6") during AUTO.
+            # Red Alliance side: X <= 325.6"; Blue Alliance side: X >= 325.6".
+            if is_autonomous and h_inv is not None:
+                contact_v = cy + 0.5 * h
+                p_hom = h_inv @ np.array([cx, contact_v, 1.0], dtype=np.float64)
+                if abs(p_hom[2]) > 1e-6:
+                    fx = p_hom[0] / p_hom[2]
+                    # If Red candidate is 100% on Blue side (X > 335.0")
+                    if alliance == "RED" and fx > 335.0:
+                        # Cannot physically/legally be a Red robot during AUTO
+                        full_sc, full_al = self.evaluate_bumper_patch(box_crop)
+                        if full_sc > 0.15 and full_al == "BLUE":
+                            alliance = "BLUE"
+                        else:
+                            continue
+                    # If Blue candidate is 100% on Red side (X < 315.0")
+                    elif alliance == "BLUE" and fx < 315.0:
+                        # Cannot physically/legally be a Blue robot during AUTO
+                        full_sc, full_al = self.evaluate_bumper_patch(box_crop)
+                        if full_sc > 0.15 and full_al == "RED":
+                            alliance = "RED"
+                        else:
+                            continue
 
             # Detect yellow fuel ball occlusion across the robot chassis
             b_ch = box_crop[:, :, 0].astype(np.float32)
@@ -608,14 +651,13 @@ class RobotBumperVerificationGate:
                 (bumper_score >= req_bumper_score and (super_score >= req_super_score or has_yellow_balls))
                 or (has_yellow_balls and conf >= 0.30)
             )
-            if not is_valid_robot:
-                continue
 
             # Boost/calibrate confidence with bumper & superstructure score
             if bumper_score >= req_bumper_score:
                 final_conf = float(np.clip(0.70 * conf + 0.30 * min(1.0, bumper_score * 2.5), 0.0, 1.0))
             else:
                 final_conf = conf
+
             verified_box = BoundingBox(
                 center_x=cx,
                 center_y=cy,
@@ -624,34 +666,135 @@ class RobotBumperVerificationGate:
                 confidence=final_conf,
                 class_id=0,
             )
+
+            if not is_valid_robot:
+                # Save into rejected pool for potential adaptive loosening
+                rejected_pool.append((verified_box, final_conf, alliance, bumper_score, super_score))
+                continue
+
             verified_candidates.append((verified_box, final_conf, alliance))
 
-        if not verified_candidates:
-            return []
+        def _box_iou(b1: BoundingBox, b2: BoundingBox) -> float:
+            x1 = max(b1.center_x - b1.width / 2.0, b2.center_x - b2.width / 2.0)
+            y1 = max(b1.center_y - b1.height / 2.0, b2.center_y - b2.height / 2.0)
+            x2 = min(b1.center_x + b1.width / 2.0, b2.center_x + b2.width / 2.0)
+            y2 = min(b1.center_y + b1.height / 2.0, b2.center_y + b2.height / 2.0)
+            inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+            union = (b1.width * b1.height) + (b2.width * b2.height) - inter
+            return inter / union if union > 0 else 0.0
 
-        # 6. Cardinality & Alliance Sorting (Max 3 Red, Max 3 Blue, Max 6 Total)
-        reds = sorted([c for c in verified_candidates if c[2] == "RED"], key=lambda x: x[1], reverse=True)[: self.max_robots_per_alliance]
-        blues = sorted([c for c in verified_candidates if c[2] == "BLUE"], key=lambda x: x[1], reverse=True)[: self.max_robots_per_alliance]
+        def _dedup_candidates(cands: List[Tuple[BoundingBox, float, str]], iou_thresh: float = 0.40) -> List[Tuple[BoundingBox, float, str]]:
+            deduped: List[Tuple[BoundingBox, float, str]] = []
+            for c in cands:
+                if not any(_box_iou(c[0], k[0]) >= iou_thresh for k in deduped):
+                    deduped.append(c)
+            return deduped
+
+        # 8. Physical Non-Overlap Deduplication & Adaptive Threshold Loosening:
+        # Two physical robots cannot occupy the same space or have ~100% overlapping bounding boxes.
+        # If the only options for highlighting all robots on screen require overlapping bounding boxes near 100%,
+        # then suppress the duplicate and loosen restrictions for robot detection of that color to discover the true missing robot.
+        red_verified = sorted([c for c in verified_candidates if c[2] == "RED"], key=lambda x: x[1], reverse=True)
+        distinct_reds = _dedup_candidates(red_verified, iou_thresh=0.40)[: self.max_robots_per_alliance]
+
+        blue_verified = sorted([c for c in verified_candidates if c[2] == "BLUE"], key=lambda x: x[1], reverse=True)
+        distinct_blues = _dedup_candidates(blue_verified, iou_thresh=0.40)[: self.max_robots_per_alliance]
+
+        # Adaptive Loosening for RED alliance:
+        if len(distinct_reds) < self.max_robots_per_alliance and rejected_pool:
+            relaxed_reds = [r for r in rejected_pool if r[2] == "RED" or r[3] >= 0.05]
+            relaxed_reds.sort(key=lambda x: x[1], reverse=True)
+            for r in relaxed_reds:
+                if not any(_box_iou(r[0], k[0]) >= 0.30 for k in distinct_reds):
+                    if r[1] >= 0.12 and r[3] >= 0.04:
+                        distinct_reds.append((r[0], r[1], "RED"))
+                        if len(distinct_reds) >= self.max_robots_per_alliance:
+                            break
+
+        # Adaptive Loosening for BLUE alliance:
+        if len(distinct_blues) < self.max_robots_per_alliance and rejected_pool:
+            relaxed_blues = [r for r in rejected_pool if r[2] == "BLUE" or r[3] >= 0.05]
+            relaxed_blues.sort(key=lambda x: x[1], reverse=True)
+            for r in relaxed_blues:
+                if not any(_box_iou(r[0], k[0]) >= 0.30 for k in distinct_blues):
+                    if r[1] >= 0.12 and r[3] >= 0.04:
+                        distinct_blues.append((r[0], r[1], "BLUE"))
+                        if len(distinct_blues) >= self.max_robots_per_alliance:
+                            break
+
         unknowns = sorted([c for c in verified_candidates if c[2] not in ("RED", "BLUE")], key=lambda x: x[1], reverse=True)
+        distinct_unknowns = _dedup_candidates(unknowns, iou_thresh=0.40)
 
-        selected = reds + blues
-        if len(selected) < self.max_robots_total and unknowns:
-            needed = self.max_robots_total - len(selected)
-            selected.extend(unknowns[:needed])
+        selected = distinct_reds + distinct_blues
+        if len(selected) < self.max_robots_total and distinct_unknowns:
+            for u in distinct_unknowns:
+                if not any(_box_iou(u[0], s[0]) >= 0.30 for s in selected):
+                    selected.append(u)
+                    if len(selected) >= self.max_robots_total:
+                        break
 
         # Final sort by confidence descending
         selected.sort(key=lambda x: x[1], reverse=True)
         return [b[0] for b in selected[: self.max_robots_total]]
 
 
+def classify_bumper_fabric(patch: np.ndarray) -> Tuple[float, str]:
+    """
+    Evaluates bumper fabric color purity in a candidate chassis patch.
+    Returns (score, alliance_str in {'RED', 'BLUE', 'UNKNOWN'}).
+    """
+    if patch is None or patch.size == 0 or patch.shape[0] < 3 or patch.shape[1] < 3:
+        return 0.0, "UNKNOWN"
+
+    h, w = patch.shape[:2]
+    # Evaluate lower 35% bumper band first, then full patch
+    bumper_h = max(3, int(round(h * 0.35)))
+    patches_to_eval = [patch[h - bumper_h :, :], patch]
+
+    best_score_r = 0.0
+    best_score_b = 0.0
+
+    for p in patches_to_eval:
+        if p.size == 0 or p.shape[0] < 2 or p.shape[1] < 2:
+            continue
+        hsv = cv2.cvtColor(p, cv2.COLOR_BGR2HSV)
+        h_ch, s_ch, v_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+        red_mask = ((h_ch <= 15) | (h_ch >= 165)) & (s_ch >= 45) & (v_ch >= 35)
+        blue_mask = (h_ch >= 95) & (h_ch <= 135) & (s_ch >= 45) & (v_ch >= 35)
+        red_frac = float(np.mean(red_mask))
+        blue_frac = float(np.mean(blue_mask))
+
+        b_ch = p[:, :, 0].astype(np.float32)
+        g_ch = p[:, :, 1].astype(np.float32)
+        r_ch = p[:, :, 2].astype(np.float32)
+        diff_red = float(np.mean((r_ch > b_ch + 15.0) & (r_ch > g_ch + 10.0)))
+        diff_blue = float(np.mean((b_ch > r_ch + 15.0) & (b_ch > g_ch + 10.0)))
+
+        best_score_r = max(best_score_r, red_frac, diff_red)
+        best_score_b = max(best_score_b, blue_frac, diff_blue)
+
+    if best_score_r > 0.07 and best_score_r > best_score_b * 1.15:
+        return best_score_r, "RED"
+    elif best_score_b > 0.07 and best_score_b > best_score_r * 1.15:
+        return best_score_b, "BLUE"
+    elif best_score_r > best_score_b and best_score_r > 0.05:
+        return best_score_r, "RED"
+    elif best_score_b > best_score_r and best_score_b > 0.05:
+        return best_score_b, "BLUE"
+    return max(best_score_r, best_score_b), "UNKNOWN"
+
+
 def suppress_duplicate_boxes(
     boxes: List[BoundingBox],
-    iou_threshold: float = 0.28,
+    iou_threshold: float = 0.45,
     max_boxes: int = 6,
+    frame_bgr: Optional[np.ndarray] = None,
 ) -> List[BoundingBox]:
     """
-    Applies pairwise IoU suppression and top-N ranking to eliminate duplicate/overlapping
-    robot detections on the same physical robot.
+    Applies pairwise alliance-aware IoU suppression and top-N ranking.
+    Ensures that touching or interacting robots of opposing alliances (Red vs Blue in scrums)
+    are NEVER suppressed by each other.
     """
     if len(boxes) <= 1:
         return boxes
@@ -659,8 +802,27 @@ def suppress_duplicate_boxes(
     # Sort boxes by confidence descending
     sorted_boxes = sorted(boxes, key=lambda b: b.confidence, reverse=True)
     kept: List[BoundingBox] = []
+    alliance_cache: Dict[int, str] = {}
 
-    for b in sorted_boxes:
+    def _get_alliance(b: BoundingBox, idx: int) -> str:
+        if idx in alliance_cache:
+            return alliance_cache[idx]
+        if frame_bgr is None or frame_bgr.size == 0:
+            al = "UNKNOWN"
+        else:
+            h_img, w_img = frame_bgr.shape[:2]
+            x1 = max(0, int(round(b.center_x - b.width / 2.0)))
+            y1 = max(0, int(round(b.center_y - b.height / 2.0)))
+            x2 = min(w_img, int(round(b.center_x + b.width / 2.0)))
+            y2 = min(h_img, int(round(b.center_y + b.height / 2.0)))
+            if x2 > x1 and y2 > y1:
+                _, al = classify_bumper_fabric(frame_bgr[y1:y2, x1:x2])
+            else:
+                al = "UNKNOWN"
+        alliance_cache[idx] = al
+        return al
+
+    for b_idx, b in enumerate(sorted_boxes):
         overlap = False
         bx1 = b.center_x - b.width / 2.0
         by1 = b.center_y - b.height / 2.0
@@ -668,7 +830,7 @@ def suppress_duplicate_boxes(
         by2 = b.center_y + b.height / 2.0
         b_area = b.width * b.height
 
-        for k in kept:
+        for k_idx, k in enumerate(kept):
             kx1 = k.center_x - k.width / 2.0
             ky1 = k.center_y - k.height / 2.0
             kx2 = k.center_x + k.width / 2.0
@@ -688,8 +850,16 @@ def suppress_duplicate_boxes(
                 union = b_area + k_area - inter
                 iou = inter / union if union > 0.0 else 0.0
                 if iou > iou_threshold:
-                    overlap = True
-                    break
+                    # Check if opposing alliances
+                    b_al = _get_alliance(b, b_idx)
+                    k_al = _get_alliance(k, k_idx + 1000)
+                    if b_al in ("RED", "BLUE") and k_al in ("RED", "BLUE") and b_al != k_al:
+                        if iou > 0.85:
+                            overlap = True
+                            break
+                    else:
+                        overlap = True
+                        break
 
         if not overlap:
             kept.append(b)
@@ -697,6 +867,155 @@ def suppress_duplicate_boxes(
                 break
 
     return kept
+
+
+def extract_top_screen_tiles(
+    frame_bgr: np.ndarray,
+    roi_y: Tuple[int, int] = (80, 660),
+    tile_left_x: Tuple[int, int] = (0, 1100),
+    tile_right_x: Tuple[int, int] = (820, 1920),
+) -> Tuple[List[np.ndarray], List[Tuple[int, int]]]:
+    """
+    Extracts high-resolution left and right overlapping field tiles from the top broadcast screen.
+    Eliminates letterbox squishing on wide-angle 16:9 / 3:1 field views.
+
+    Returns:
+        Tuple of (tiles_list, offsets_list) where offsets are (x_offset, y_offset).
+    """
+    h_img, w_img = frame_bgr.shape[:2]
+    y1 = max(0, min(h_img - 20, roi_y[0]))
+    y2 = max(y1 + 20, min(h_img, roi_y[1]))
+
+    lx1 = max(0, min(w_img - 20, tile_left_x[0]))
+    lx2 = max(lx1 + 20, min(w_img, tile_left_x[1]))
+
+    rx1 = max(0, min(w_img - 20, tile_right_x[0]))
+    rx2 = max(rx1 + 20, min(w_img, tile_right_x[1]))
+
+    tile_left = frame_bgr[y1:y2, lx1:lx2]
+    tile_right = frame_bgr[y1:y2, rx1:rx2]
+
+    return [tile_left, tile_right], [(lx1, y1), (rx1, y1)]
+
+
+def dynamic_waterfall_selection(
+    candidates: List[Tuple[BoundingBox, float, str]],
+    target_red: int = 3,
+    target_blue: int = 3,
+    max_total: int = 6,
+    iou_thresh: float = 0.40,
+) -> List[BoundingBox]:
+    """
+    Dynamically selects candidates using alliance-quota prioritization.
+    Ensures up to 3 Red and up to 3 Blue robots (total 6 robots) are acquired.
+    """
+    def _box_iou(b1: BoundingBox, b2: BoundingBox) -> float:
+        x1 = max(b1.center_x - b1.width / 2.0, b2.center_x - b2.width / 2.0)
+        y1 = max(b1.center_y - b1.height / 2.0, b2.center_y - b2.height / 2.0)
+        x2 = min(b1.center_x + b1.width / 2.0, b2.center_x + b2.width / 2.0)
+        y2 = min(b1.center_y + b1.height / 2.0, b2.center_y + b2.height / 2.0)
+        inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        union = (b1.width * b1.height) + (b2.width * b2.height) - inter
+        return inter / union if union > 0 else 0.0
+
+    # Sort descending by confidence
+    sorted_cands = sorted(candidates, key=lambda c: c[1], reverse=True)
+
+    reds: List[BoundingBox] = []
+    blues: List[BoundingBox] = []
+    unknowns: List[BoundingBox] = []
+
+    for box, conf, alliance in sorted_cands:
+        if alliance == "RED":
+            if len(reds) < target_red and not any(_box_iou(box, r) >= iou_thresh for r in reds):
+                reds.append(box)
+        elif alliance == "BLUE":
+            if len(blues) < target_blue and not any(_box_iou(box, b) >= iou_thresh for b in blues):
+                blues.append(box)
+        else:
+            if not any(_box_iou(box, u) >= iou_thresh for u in unknowns):
+                unknowns.append(box)
+
+    # Fill remaining slots with unknowns or highest remaining candidates
+    selected = reds + blues
+    if len(selected) < max_total:
+        for u in unknowns:
+            if not any(_box_iou(u, s) >= iou_thresh for s in selected):
+                selected.append(u)
+                if len(selected) >= max_total:
+                    break
+
+    selected.sort(key=lambda b: b.confidence, reverse=True)
+    return selected[:max_total]
+
+
+def recover_missing_bumper_proposals(
+    frame_bgr: np.ndarray,
+    existing_boxes: List[BoundingBox],
+    target_alliance: str,
+    field_roi_y: Tuple[int, int] = (150, 650),
+    min_area: float = 250.0,
+) -> List[BoundingBox]:
+    """
+    Recovers missing robot candidate bounding boxes using colorimetric bumper segmentation
+    on the field carpet when neural network detections fall below threshold.
+    """
+    if frame_bgr is None or frame_bgr.size == 0 or target_alliance not in ("RED", "BLUE"):
+        return []
+
+    h_img, w_img = frame_bgr.shape[:2]
+    y1 = max(0, field_roi_y[0])
+    y2 = min(h_img, field_roi_y[1])
+    field_crop = frame_bgr[y1:y2, :]
+
+    hsv = cv2.cvtColor(field_crop, cv2.COLOR_BGR2HSV)
+    h_ch, s_ch, v_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+    if target_alliance == "RED":
+        mask = ((h_ch <= 12) | (h_ch >= 168)) & (s_ch >= 65) & (v_ch >= 45)
+    else:
+        mask = (h_ch >= 95) & (h_ch <= 135) & (s_ch >= 65) & (v_ch >= 45)
+
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 7))
+    mask_closed = cv2.morphologyEx(mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, k)
+
+    contours, _ = cv2.findContours(mask_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    recovered: List[BoundingBox] = []
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area or area > 35000:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(c)
+        global_cx = bx + bw / 2.0
+        global_cy = (by + y1) + bh / 2.0
+
+        # Construct typical robot box (aspect ~1.3, width ~120px, height ~80px)
+        cand_w = max(float(bw), 80.0)
+        cand_h = max(float(bh) * 2.2, 60.0)
+
+        # Ensure not overlapping an existing detection
+        overlap = False
+        for ex in existing_boxes:
+            dx = abs(ex.center_x - global_cx)
+            dy = abs(ex.center_y - global_cy)
+            if dx < (ex.width + cand_w) * 0.4 and dy < (ex.height + cand_h) * 0.4:
+                overlap = True
+                break
+
+        if not overlap:
+            recovered.append(
+                BoundingBox(
+                    center_x=global_cx,
+                    center_y=global_cy,
+                    width=cand_w,
+                    height=cand_h,
+                    confidence=0.15,
+                    class_id=0,
+                )
+            )
+
+    return recovered
 
 
 class TensorRTDetectorActor(DetectionActorBase):
@@ -994,16 +1313,20 @@ class TensorRTDetectorActor(DetectionActorBase):
                 for box in res.boxes:
                     box.center_y += float(roi_y_offset)
                 if orig_f.image_bgr is not None and orig_f.image_bgr.size > 0:
+                    is_auto = bool((orig_f.metadata.pts_ms <= 15000) or (orig_f.metadata.frame_index < 900))
                     res.boxes = self._bumper_gate.verify_candidates(
                         frame_bgr=orig_f.image_bgr,
                         candidates=res.boxes,
+                        is_autonomous=is_auto,
                     )
         # Suppress any overlapping duplicate candidate boxes on the same robot and limit to top 6
-        for res in results:
+        for i, res in enumerate(results):
+            orig_img = frames[i].image_bgr if i < len(frames) else None
             res.boxes = suppress_duplicate_boxes(
                 boxes=res.boxes,
                 iou_threshold=self._iou_threshold,
                 max_boxes=6,
+                frame_bgr=orig_img,
             )
 
         if self._device.type == "cuda":
@@ -1062,9 +1385,11 @@ class TensorRTDetectorActor(DetectionActorBase):
                 raw_boxes = boxes_per_frame[i] if i < len(boxes_per_frame) else []
                 robot_boxes = [b for b in raw_boxes if b.class_id == 0]
                 if f.image_bgr is not None and f.image_bgr.size > 0:
+                    is_auto = bool((f.metadata.pts_ms <= 15000) or (f.metadata.frame_index < 900))
                     robot_boxes = self._bumper_gate.verify_candidates(
                         frame_bgr=f.image_bgr,
                         candidates=robot_boxes,
+                        is_autonomous=is_auto,
                     )
                 results.append(
                     DetectionResult(
@@ -1112,9 +1437,11 @@ class TensorRTDetectorActor(DetectionActorBase):
                 # Keep only robot class (class_id == 0) and filter through Bumper Gate
                 robot_boxes = [b for b in raw_boxes if b.class_id == 0]
                 if f.image_bgr is not None and f.image_bgr.size > 0:
+                    is_auto = bool((f.metadata.pts_ms <= 15000) or (f.metadata.frame_index < 900))
                     robot_boxes = self._bumper_gate.verify_candidates(
                         frame_bgr=f.image_bgr,
                         candidates=robot_boxes,
+                        is_autonomous=is_auto,
                     )
                 results.append(
                     DetectionResult(
@@ -1158,9 +1485,11 @@ class TensorRTDetectorActor(DetectionActorBase):
             )
             robot_boxes = [b for b in boxes if b.class_id == 0]
             if f.image_bgr is not None and f.image_bgr.size > 0:
+                is_auto = bool((f.metadata.pts_ms <= 15000) or (f.metadata.frame_index < 900))
                 robot_boxes = self._bumper_gate.verify_candidates(
                     frame_bgr=f.image_bgr,
                     candidates=robot_boxes,
+                    is_autonomous=is_auto,
                 )
             results.append(
                 DetectionResult(

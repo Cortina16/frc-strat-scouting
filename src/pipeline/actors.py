@@ -235,10 +235,17 @@ if not hasattr(TrackingActor, "_orig_update_tracks"):
         homography: HomographyEstimate,
         frame_bgr: Any,
         embeddings: Optional[Sequence[np.ndarray]] = None,
+        is_autonomous: Optional[bool] = None,
     ) -> List[RobotTrackletState]:
         resolved_bgr = await resolve_frame_bgr(frame_bgr)
         return await self._orig_update_tracks(
-            frame_index, detections, ocr_results, homography, resolved_bgr, embeddings
+            frame_index=frame_index,
+            detections=detections,
+            ocr_results=ocr_results,
+            homography=homography,
+            frame_bgr=resolved_bgr,
+            embeddings=embeddings,
+            is_autonomous=is_autonomous,
         )  # type: ignore[attr-defined]
 
     TrackingActor.update_tracks = _update_tracks  # type: ignore[assignment]
@@ -251,6 +258,7 @@ if not hasattr(TrackingActor, "update_tracks_batch"):
         ocr_batch: List[List[OCRResult]],
         homographies: List[HomographyEstimate],
         frames: List[Any],
+        is_autonomous: Optional[bool] = None,
     ) -> List[List[RobotTrackletState]]:
         resolved_bgrs = await asyncio.gather(*[resolve_frame_bgr(f) for f in frames])
         batch_active_tracks: List[List[RobotTrackletState]] = []
@@ -264,11 +272,12 @@ if not hasattr(TrackingActor, "update_tracks_batch"):
                 await self.bridge_lost_tracklets(camera_cut=True)
 
             active_tracks = await self.update_tracks(
-                frame_idx,
-                det_boxes,
-                ocr_res,
-                h_est,
-                frame_bgr,
+                frame_index=frame_idx,
+                detections=det_boxes,
+                ocr_results=ocr_res,
+                homography=h_est,
+                frame_bgr=frame_bgr,
+                is_autonomous=is_autonomous,
             )
 
             if not h_est.camera_cut:
@@ -320,6 +329,26 @@ if not hasattr(DuckDBStorageActor, "insert_multi_frame_batch"):
                 )
 
     DuckDBStorageActor.insert_multi_frame_batch = _insert_multi_frame_batch  # type: ignore[attr-defined]
+
+if not hasattr(DuckDBStorageActor, "insert_multi_frame_ball_batch"):
+    async def _insert_multi_frame_ball_batch(
+        self: DuckDBStorageActor,
+        frame_balls: List[Tuple[Sequence[BallTrackletState], int]],
+    ) -> None:
+        async with self._lock:
+            if hasattr(self._store, "insert_multi_frame_ball_batch"):
+                self._store.insert_multi_frame_ball_batch(frame_balls, match_id=self.match_id)
+            else:
+                for balls, frame_index in frame_balls:
+                    if balls:
+                        self._store.insert_ball_trajectory_batch(
+                            balls=balls,
+                            frame_index=frame_index,
+                            match_id=self.match_id,
+                        )
+
+    DuckDBStorageActor.insert_multi_frame_ball_batch = _insert_multi_frame_ball_batch  # type: ignore[attr-defined]
+
 
 
 # --- MQTTTelemetryPublisherActor: Batched live telemetry publishing ---
@@ -699,6 +728,7 @@ def create_remote_actors(
         red_teams=red_teams,
         blue_teams=blue_teams,
         max_coast_frames=max_coast_frames,
+        mandatory_attribution=bool(red_teams or blue_teams),
     )
     action = RemoteActionRecognitionActor.options(**act_opts).remote(
         fps=float(target_fps),
@@ -779,6 +809,7 @@ def create_local_actors(
         red_teams=red_teams,
         blue_teams=blue_teams,
         max_coast_frames=max_coast_frames,
+        mandatory_attribution=bool(red_teams or blue_teams),
     )
     action = ActionRecognitionActor(
         fps=float(target_fps),

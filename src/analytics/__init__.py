@@ -32,6 +32,15 @@ from src.analytics.duckdb_store import (
     query_match_summary,
     query_velocity_degradation,
 )
+from src.analytics.flow_orchestrator import AnalyticsFlowOrchestrator, FlowExecutionResult
+from src.analytics.hub_scorer import AllianceScoreAttribution, HubGeometry, HubScoringDetector, ShotEvent
+from src.analytics.match_predictor import MatchPrediction, MatchPredictor, ValidationReport
+from src.analytics.metrics_engine import AnalyticsMetricsEngine, PhaseMetrics
+from src.analytics.monte_carlo import MonteCarloSimulationEngine, SimulationResult
+from src.analytics.tba_client import MatchMetadata, TheBlueAllianceClient
+from src.analytics.scoreboard_reader import BroadcastScoreboardReader, ScoreboardReading
+from src.analytics.video_watcher import RobotObservation, VideoMatchAnalysisResult, VideoWatcher
+from src.analytics.visualizer import AnalyticsPredictionVisualizer
 
 __all__ = [
     "DuckDBStorageActor",
@@ -59,4 +68,25 @@ __all__ = [
     "TRENCH_X_MAX",
     "TRENCH_NORTH_Y_MIN",
     "TRENCH_SOUTH_Y_MAX",
+    "TheBlueAllianceClient",
+    "MatchMetadata",
+    "HubGeometry",
+    "HubScoringDetector",
+    "ShotEvent",
+    "AllianceScoreAttribution",
+    "AnalyticsMetricsEngine",
+    "PhaseMetrics",
+    "MonteCarloSimulationEngine",
+    "SimulationResult",
+    "MatchPredictor",
+    "MatchPrediction",
+    "ValidationReport",
+    "VideoWatcher",
+    "RobotObservation",
+    "VideoMatchAnalysisResult",
+    "AnalyticsFlowOrchestrator",
+    "FlowExecutionResult",
+    "BroadcastScoreboardReader",
+    "ScoreboardReading",
+    "AnalyticsPredictionVisualizer",
 ]

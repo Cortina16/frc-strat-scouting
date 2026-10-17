@@ -269,9 +269,33 @@ if pa is not None:
         ("is_reconciled", pa.bool_()),
         ("reconciled_posterior", pa.float32()),
     ])
+
+    PYARROW_BALL_TRAJECTORY_SCHEMA = pa.schema([
+        ("match_id", pa.string()),
+        ("frame_index", pa.int64()),
+        ("timestamp_ms", pa.int64()),
+        ("ball_id", pa.int32()),
+        ("pixel_center_x", pa.float32()),
+        ("pixel_center_y", pa.float32()),
+        ("pixel_radius", pa.float32()),
+        ("field_x_inch", pa.float32()),
+        ("field_y_inch", pa.float32()),
+        ("field_z_inch", pa.float32()),
+        ("center_rel_x_inch", pa.float32()),
+        ("center_rel_y_inch", pa.float32()),
+        ("center_rel_z_inch", pa.float32()),
+        ("depth_inch", pa.float32()),
+        ("velocity_x_ips", pa.float32()),
+        ("velocity_y_ips", pa.float32()),
+        ("ball_state", pa.string()),
+        ("occluded_by_robot_id", pa.int32()),
+        ("is_cluster", pa.bool_()),
+        ("cluster_ball_count", pa.int32()),
+    ])
 else:
     PYARROW_TRAJECTORY_SCHEMA = None  # type: ignore[assignment]
     PYARROW_ACTION_SCHEMA = None  # type: ignore[assignment]
+    PYARROW_BALL_TRAJECTORY_SCHEMA = None  # type: ignore[assignment]
 
 
 # ============================================================================
@@ -920,16 +944,87 @@ class DuckDBStore:
         """Appends a batch of yellow ball tracklet states to the `ball_trajectories` table."""
         if not balls:
             return 0
+        return self._insert_balls_internal([(b, frame_index) for b in balls], match_id=match_id)
 
+    def insert_multi_frame_ball_batch(
+        self,
+        frame_balls: List[Tuple[Sequence[BallTrackletState], int]],
+        match_id: Optional[str] = None,
+    ) -> int:
+        """Appends multiple frames of ball tracklet states in a single vectorized operation."""
+        if not frame_balls:
+            return 0
+        items = [(b, f_idx) for balls, f_idx in frame_balls for b in balls]
+        if not items:
+            return 0
+        return self._insert_balls_internal(items, match_id=match_id)
+
+    def _insert_balls_internal(
+        self,
+        balls_with_frames: Sequence[Tuple[BallTrackletState, int]],
+        match_id: Optional[str] = None,
+    ) -> int:
+        if not balls_with_frames:
+            return 0
         m_id = match_id or self.default_match_id
-        count = len(balls)
-        ts = int(frame_index * (1000.0 / self.fps))
+        count = len(balls_with_frames)
 
+        if pa is not None and PYARROW_BALL_TRAJECTORY_SCHEMA is not None:
+            match_ids = [m_id] * count
+            frame_indices = [int(f_idx) for _, f_idx in balls_with_frames]
+            timestamps = [int(f_idx * (1000.0 / self.fps)) for _, f_idx in balls_with_frames]
+            ball_ids = [int(b.ball_id) for b, _ in balls_with_frames]
+            px_cx = [float(b.pixel_bbox.center_x) if b.pixel_bbox else 0.0 for b, _ in balls_with_frames]
+            px_cy = [float(b.pixel_bbox.center_y) if b.pixel_bbox else 0.0 for b, _ in balls_with_frames]
+            px_r = [float(b.radius_px) for b, _ in balls_with_frames]
+            fx = [float(b.field_x_inch) for b, _ in balls_with_frames]
+            fy = [float(b.field_y_inch) for b, _ in balls_with_frames]
+            fz = [float(getattr(b, "field_z_inch", 2.955) if getattr(b, "field_z_inch", None) is not None else 2.955) for b, _ in balls_with_frames]
+            cr_x = [float(getattr(b, "center_rel_x_inch", None) if getattr(b, "center_rel_x_inch", None) is not None else (b.field_x_inch - 325.6)) for b, _ in balls_with_frames]
+            cr_y = [float(getattr(b, "center_rel_y_inch", None) if getattr(b, "center_rel_y_inch", None) is not None else (b.field_y_inch - 158.85)) for b, _ in balls_with_frames]
+            cr_z = [float(getattr(b, "center_rel_z_inch", None) if getattr(b, "center_rel_z_inch", None) is not None else getattr(b, "field_z_inch", 2.955)) for b, _ in balls_with_frames]
+            depths = [float(getattr(b, "depth_inch", 0.0) or 0.0) for b, _ in balls_with_frames]
+            vx = [float(b.velocity_x_ips) for b, _ in balls_with_frames]
+            vy = [float(b.velocity_y_ips) for b, _ in balls_with_frames]
+            states = [b.state.value if hasattr(b.state, "value") else str(b.state) for b, _ in balls_with_frames]
+            occluded = [int(b.occluded_by_robot_id) if b.occluded_by_robot_id is not None else None for b, _ in balls_with_frames]
+            is_clusters = [bool(getattr(b, "is_cluster", False)) for b, _ in balls_with_frames]
+            cluster_counts = [int(getattr(b, "cluster_ball_count", 1)) for b, _ in balls_with_frames]
+
+            cols = [
+                pa.array(match_ids, type=pa.string()),
+                pa.array(frame_indices, type=pa.int64()),
+                pa.array(timestamps, type=pa.int64()),
+                pa.array(ball_ids, type=pa.int32()),
+                pa.array(px_cx, type=pa.float32()),
+                pa.array(px_cy, type=pa.float32()),
+                pa.array(px_r, type=pa.float32()),
+                pa.array(fx, type=pa.float32()),
+                pa.array(fy, type=pa.float32()),
+                pa.array(fz, type=pa.float32()),
+                pa.array(cr_x, type=pa.float32()),
+                pa.array(cr_y, type=pa.float32()),
+                pa.array(cr_z, type=pa.float32()),
+                pa.array(depths, type=pa.float32()),
+                pa.array(vx, type=pa.float32()),
+                pa.array(vy, type=pa.float32()),
+                pa.array(states, type=pa.string()),
+                pa.array(occluded, type=pa.int32()),
+                pa.array(is_clusters, type=pa.bool_()),
+                pa.array(cluster_counts, type=pa.int32()),
+            ]
+            batch = pa.RecordBatch.from_arrays(cols, schema=PYARROW_BALL_TRAJECTORY_SCHEMA)
+            self._con.register("_tmp_ball_batch", batch)
+            self._con.execute("INSERT INTO ball_trajectories SELECT * FROM _tmp_ball_batch")
+            self._con.unregister("_tmp_ball_batch")
+            return count
+
+        # Fallback to executemany
         rows = [
             (
                 m_id,
-                int(frame_index),
-                int(ts),
+                int(f_idx),
+                int(f_idx * (1000.0 / self.fps)),
                 int(b.ball_id),
                 float(b.pixel_bbox.center_x),
                 float(b.pixel_bbox.center_y),
@@ -948,7 +1043,7 @@ class DuckDBStore:
                 bool(getattr(b, "is_cluster", False)),
                 int(getattr(b, "cluster_ball_count", 1)),
             )
-            for b in balls
+            for b, f_idx in balls_with_frames
         ]
         sql = "INSERT INTO ball_trajectories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         self._con.executemany(sql, rows)
@@ -1308,6 +1403,23 @@ class DuckDBStorageActor(StorageActorBase):
                 frame_index=frame_index,
                 match_id=self.match_id,
             )
+
+    async def insert_multi_frame_ball_batch(
+        self,
+        frame_balls: List[Tuple[Sequence[BallTrackletState], int]],
+    ) -> None:
+        """Appends multiple frames of ball trajectory states to DuckDB ball_trajectories table."""
+        async with self._lock:
+            if hasattr(self._store, "insert_multi_frame_ball_batch"):
+                self._store.insert_multi_frame_ball_batch(frame_balls, match_id=self.match_id)
+            else:
+                for balls, frame_index in frame_balls:
+                    if balls:
+                        self._store.insert_ball_trajectory_batch(
+                            balls=balls,
+                            frame_index=frame_index,
+                            match_id=self.match_id,
+                        )
 
     async def insert_action_events(self, actions: List[ActionSegment]) -> None:
         """Inserts reconciled action localization events into DuckDB action tables."""

@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FRC 2026 REBUILT — 3D Match Digital Twin</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <!-- Fullscreen 3D Viewport Container -->
+  <div id="viewport-container">
+    <canvas id="viewport-canvas"></canvas>
+  </div>
+
+  <!-- Loading & Initializing Overlay -->
+  <div id="loading-overlay" class="loading-overlay">
+    <div class="spinner"></div>
+    <div id="loading-status" class="loading-text">Loading 3D Field CAD & Match Telemetry...</div>
+  </div>
+
+  <!-- Top Navigation Bar -->
+  <header class="top-navbar">
+    <div class="nav-left">
+      <div class="brand-wrapper">
+        <div class="brand-icon">
+          <svg viewBox="0 0 24 24">
+            <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path>
+          </svg>
+        </div>
+        <div class="brand-title-group">
+          <div class="brand-title">
+            FRC 2026 REBUILT
+            <span class="brand-badge">3D Digital Twin</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Match Selector Dropdown -->
+      <div class="match-selector-wrapper">
+        <select id="match-select" class="match-select" aria-label="Select Match">
+          <option value="" disabled selected>Loading Matches...</option>
+        </select>
+        <svg class="match-select-arrow" viewBox="0 0 20 20">
+          <path d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z"></path>
+        </svg>
+      </div>
+    </div>
+
+    <!-- Match Status Indicators -->
+    <div class="nav-center">
+      <div id="status-indicator" class="status-pill replay">
+        <span class="status-dot"></span>
+        <span id="status-text">REPLAY</span>
+      </div>
+      <div id="fps-counter" class="fps-badge">60.0 FPS</div>
+      <div id="frame-counter" class="frame-counter-badge">Frame: -- / --</div>
+    </div>
+
+    <!-- Camera View Presets & Quick Actions -->
+    <div class="nav-right">
+      <div class="camera-preset-group" role="group" aria-label="Camera Presets">
+        <button id="preset-free" class="preset-btn active" title="Free Orbit View (OrbitControls)">
+          Free Orbit
+        </button>
+        <button id="preset-topdown" class="preset-btn" title="Bird's Eye Top-Down View [T]">
+          Top-Down
+        </button>
+        <button id="preset-broadcast" class="preset-btn" title="Elevated Sideline Broadcast View">
+          Broadcast
+        </button>
+        <button id="preset-redwall" class="preset-btn btn-red-wall" title="Red Driver Station Wall View">
+          Red Wall
+        </button>
+        <button id="preset-bluewall" class="preset-btn btn-blue-wall" title="Blue Driver Station Wall View">
+          Blue Wall
+        </button>
+        <button id="preset-follow" class="preset-btn" title="Follow Selected Robot Cube">
+          Follow Robot
+        </button>
+      </div>
+
+      <button id="btn-help" class="icon-btn" title="Keyboard Shortcuts [?]">
+        ?
+      </button>
+    </div>
+  </header>
+
+  <!-- Right Robot Inspector Drawer (Collapsible) -->
+  <aside id="robot-inspector" class="robot-inspector" aria-label="Robot Inspector">
+    <div id="inspector-banner" class="inspector-banner">
+      <div class="team-badge-group">
+        <div class="team-number-display">
+          <span id="inspector-team-number">TEAM 254</span>
+          <span id="inspector-alliance-badge" class="alliance-tag red">RED</span>
+        </div>
+        <div id="inspector-track-id" class="track-id-sub">Track ID #1</div>
+      </div>
+      <button id="btn-close-inspector" class="close-btn" title="Close Drawer [Esc]">
+        ✕
+      </button>
+    </div>
+
+    <div class="inspector-body">
+      <!-- Current Action Banner -->
+      <div class="action-status-card">
+        <span class="action-label">Current Action</span>
+        <span id="inspector-action-badge" class="action-badge score-hub">SCORE_HUB</span>
+      </div>
+
+      <!-- Telemetry Data Grid -->
+      <div class="telemetry-grid">
+        <div class="telemetry-item">
+          <span class="telemetry-label">Linear Speed</span>
+          <span id="inspector-speed-ips" class="telemetry-val">0.0 ips</span>
+          <span id="inspector-speed-mph" class="telemetry-sub">0.00 mph</span>
+        </div>
+
+        <div class="telemetry-item">
+          <span class="telemetry-label">Field Position</span>
+          <span id="inspector-coords" class="telemetry-val">0.0", 0.0"</span>
+          <span id="inspector-coords-m" class="telemetry-sub">0.00m, 0.00m</span>
+        </div>
+
+        <div class="telemetry-item">
+          <span class="telemetry-label">Center-Relative</span>
+          <span id="inspector-rel-coords" class="telemetry-val">0.0", 0.0"</span>
+          <span id="inspector-rel-coords-m" class="telemetry-sub">0.00m, 0.00m</span>
+        </div>
+
+        <div class="telemetry-item">
+          <span class="telemetry-label">Robot Dimensions</span>
+          <span id="inspector-dimensions" class="telemetry-val">22.0" × 28.0" × 28.0"</span>
+          <span id="inspector-dimensions-m" class="telemetry-sub">0.56m × 0.71m × 0.71m</span>
+        </div>
+
+        <div class="telemetry-item">
+          <span class="telemetry-label">Camera Depth</span>
+          <span id="inspector-depth" class="telemetry-val">--</span>
+          <span id="inspector-depth-m" class="telemetry-sub">3D Euclidean</span>
+        </div>
+
+        <div class="telemetry-item">
+          <span class="telemetry-label">Heading</span>
+          <span id="inspector-heading-deg" class="telemetry-val">0.0°</span>
+          <span id="inspector-heading-rad" class="telemetry-sub">0.00 rad</span>
+        </div>
+
+        <div class="telemetry-item">
+          <span class="telemetry-label">Defense State</span>
+          <span id="inspector-defense-state" class="telemetry-val">Normal</span>
+          <span id="inspector-track-state" class="telemetry-sub">TRACKED</span>
+        </div>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="inspector-actions">
+        <button id="btn-focus-robot" class="btn-primary-focus">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"></circle>
+            <circle cx="12" cy="12" r="3"></circle>
+          </svg>
+          Focus Camera
+        </button>
+        <button id="btn-deselect-robot" class="btn-secondary">
+          Deselect
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Bottom Playback Dock (Glassmorphism Control Bar) -->
+  <footer class="playback-dock" aria-label="Playback Controls">
+    <!-- Row 1: Timeline Scrubber with Event Markers -->
+    <div class="scrubber-container">
+      <div class="timeline-track-layer">
+        <div id="timeline-fill" class="timeline-fill-layer"></div>
+      </div>
+      <div id="timeline-markers" class="timeline-markers-container"></div>
+      <input type="range" id="timeline-slider" class="timeline-slider" min="0" max="100" value="0" step="0.1" aria-label="Timeline Scrubber">
+      <div id="timeline-tooltip" class="timeline-tooltip">00:00.00</div>
+    </div>
+
+    <!-- Row 2: VCR Buttons, Speed Pills & Readouts -->
+    <div class="playback-controls-row">
+      <!-- VCR Button Group -->
+      <div class="vcr-button-group">
+        <button id="btn-step-back-10" class="step-btn" title="Step Back 10 Frames [Shift + Left]">
+          ⏮ 10
+        </button>
+        <button id="btn-step-back-1" class="step-btn" title="Step Back 1 Frame [Left Arrow]">
+          ◀ 1
+        </button>
+        <button id="btn-play-pause" class="play-pause-btn" title="Play / Pause [Space]">
+          <svg id="play-icon" viewBox="0 0 24 24">
+            <polygon points="5,3 19,12 5,21"></polygon>
+          </svg>
+          <svg id="pause-icon" viewBox="0 0 24 24" style="display: none;">
+            <rect x="6" y="4" width="4" height="16"></rect>
+            <rect x="14" y="4" width="4" height="16"></rect>
+          </svg>
+        </button>
+        <button id="btn-step-fwd-1" class="step-btn" title="Step Forward 1 Frame [Right Arrow]">
+          1 ▶
+        </button>
+        <button id="btn-step-fwd-10" class="step-btn" title="Step Forward 10 Frames [Shift + Right]">
+          10 ⏭
+        </button>
+      </div>
+
+      <!-- Playback Speed Pills -->
+      <div class="speed-selector-group" role="group" aria-label="Playback Speed">
+        <button class="speed-pill" data-speed="0.25">0.25x</button>
+        <button class="speed-pill" data-speed="0.5">0.5x</button>
+        <button class="speed-pill active" data-speed="1.0">1.0x</button>
+        <button class="speed-pill" data-speed="2.0">2.0x</button>
+        <button class="speed-pill" data-speed="4.0">4.0x</button>
+      </div>
+
+      <!-- Time, Frame, and Period Readouts -->
+      <div class="time-readout-group">
+        <div class="readout-item">
+          Frame: <strong id="readout-frame">0 / 0</strong>
+        </div>
+        <div class="readout-item">
+          Time: <strong id="readout-time">0:00.00</strong>
+        </div>
+        <div id="readout-period" class="period-badge">
+          Teleop
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 3: Event Marker Legend -->
+    <div class="marker-legend">
+      <div class="legend-item">
+        <span class="legend-dot score"></span>
+        <span>SCORE_HUB</span>
+      </div>
+      <div class="legend-item">
+        <span class="legend-dot climb"></span>
+        <span>CLIMB_TOWER</span>
+      </div>
+      <div class="legend-item">
+        <span class="legend-dot defense"></span>
+        <span>DEFENSE</span>
+      </div>
+      <div class="legend-item">
+        <span class="legend-dot transit"></span>
+        <span>TRANSIT</span>
+      </div>
+    </div>
+  </footer>
+
+  <!-- Keyboard Shortcuts Modal -->
+  <div id="shortcuts-modal" class="modal-backdrop" aria-hidden="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="4" width="20" height="16" rx="2"></rect>
+            <path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M6 12h.01M10 12h.01M14 12h.01M18 12h.01M8 16h8"></path>
+          </svg>
+          Keyboard Shortcuts
+        </div>
+        <button id="btn-close-modal" class="close-btn" title="Close [Esc]">
+          ✕
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="shortcuts-grid">
+          <div class="shortcut-row">
+            <span class="shortcut-desc">Play / Pause</span>
+            <span class="keys-group"><kbd>Space</kbd></span>
+          </div>
+          <div class="shortcut-row">
+            <span class="shortcut-desc">Step Forward / Backward 1 Frame</span>
+            <span class="keys-group"><kbd>←</kbd> <kbd>→</kbd></span>
+          </div>
+          <div class="shortcut-row">
+            <span class="shortcut-desc">Step Forward / Backward 10 Frames</span>
+            <span class="keys-group"><kbd>Shift</kbd> + <kbd>←</kbd> / <kbd>→</kbd></span>
+          </div>
+          <div class="shortcut-row">
+            <span class="shortcut-desc">Focus Camera on Robot 1–6</span>
+            <span class="keys-group"><kbd>1</kbd> – <kbd>6</kbd></span>
+          </div>
+          <div class="shortcut-row">
+            <span class="shortcut-desc">Reset Camera to Free Orbit</span>
+            <span class="keys-group"><kbd>R</kbd></span>
+          </div>
+          <div class="shortcut-row">
+            <span class="shortcut-desc">Top-Down Bird's Eye View</span>
+            <span class="keys-group"><kbd>T</kbd></span>
+          </div>
+          <div class="shortcut-row">
+            <span class="shortcut-desc">Deselect Robot / Close Modal</span>
+            <span class="keys-group"><kbd>Esc</kbd></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Three.js (Local Vendor with CDN fallback) -->
+  <script src="/static/vendor/three.min.js"></script>
+  <script>
+    if (typeof THREE === 'undefined') {
+      document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"><\/script>');
+    }
+  </script>
+
+  <!-- OrbitControls (Local Vendor with CDN fallback) -->
+  <script src="/static/vendor/OrbitControls.js"></script>
+  <script>
+    if (typeof THREE !== 'undefined' && typeof THREE.OrbitControls === 'undefined') {
+      document.write('<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"><\/script>');
+    }
+  </script>
+
+  <!-- GLTFLoader (Local Vendor with CDN fallback) -->
+  <script src="/static/vendor/GLTFLoader.js"></script>
+  <script>
+    if (typeof THREE !== 'undefined' && typeof THREE.GLTFLoader === 'undefined') {
+      document.write('<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"><\/script>');
+    }
+  </script>
+
+  <!-- Main Application ES Module -->
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

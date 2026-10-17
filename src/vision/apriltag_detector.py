@@ -96,6 +96,9 @@ class AprilTagDetector:
         self.dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         self.parameters = cv2.aruco.DetectorParameters()
         self.parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        # Zero decimation: full resolution processing, zero downsampling for maximum tag sensitivity
+        self.parameters.aprilTagQuadDecimate = 0.0
+        self.parameters.aprilTagQuadSigma = 0.0
 
         # Prefer modern ArucoDetector interface (OpenCV >= 4.7)
         if hasattr(cv2.aruco, "ArucoDetector"):

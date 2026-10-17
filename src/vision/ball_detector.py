@@ -136,17 +136,29 @@ class YellowBallDetector:
         # Sort candidates by radius/prominence descending
         candidates.sort(key=lambda c: c[2], reverse=True)
 
-        # Euclidean Spatial Non-Maximum Suppression
+        # Euclidean Spatial Non-Maximum Suppression with spatial grid hashing
         kept: List[Tuple[float, float, float, float]] = []
+        cell_size = max(self.min_separation_px, self.max_radius_px, 1.0)
+        grid: Dict[Tuple[int, int], List[Tuple[float, float, float]]] = {}
         for cx, cy, r_val, conf in candidates:
+            gx, gy = int(cx / cell_size), int(cy / cell_size)
             too_close = False
-            for kx, ky, kr, _ in kept:
-                sep_thresh = max(self.min_separation_px, max(r_val, kr) * 0.85)
-                if (cx - kx) ** 2 + (cy - ky) ** 2 < (sep_thresh ** 2):
-                    too_close = True
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    neighbor = grid.get((gx + dx, gy + dy))
+                    if neighbor is not None:
+                        for kx, ky, kr in neighbor:
+                            sep_thresh = max(self.min_separation_px, max(r_val, kr) * 0.85)
+                            if (cx - kx) ** 2 + (cy - ky) ** 2 < (sep_thresh ** 2):
+                                too_close = True
+                                break
+                    if too_close:
+                        break
+                if too_close:
                     break
             if not too_close:
                 kept.append((cx, cy, r_val, conf))
+                grid.setdefault((gx, gy), []).append((cx, cy, r_val))
 
         return kept
 
@@ -352,3 +364,81 @@ class YellowBallDetector:
         for f in frames:
             results.append(self.detect_frame(f))
         return results
+
+
+def detect_flying_balls_near_hubs(
+    frame_bgr: np.ndarray,
+    blue_bbox: Optional[Tuple[float, float, float, float]] = None,
+    red_bbox: Optional[Tuple[float, float, float, float]] = None,
+) -> List[Tuple[float, float]]:
+    """
+    Direct screen-space detector targeting fast-moving / flying yellow balls (FUEL)
+    near Hub scoring catchment zones.
+
+    Operates directly in broadcast image space rather than ground-plane homography space,
+    avoiding severe Z=72" parallax distortion. Uses relaxed HSV and RGB chromaticity thresholds
+    to capture motion-blurred, pale, or stadium-lit flying balls.
+    """
+    if frame_bgr is None or frame_bgr.size == 0:
+        return []
+
+    h_img, w_img = frame_bgr.shape[:2]
+    flying_balls: List[Tuple[float, float]] = []
+
+    # Inspect expanded ROIs around both Blue and Red Hub funnels
+    # Expanding upward by 140px captures balls descending along high ballistic arcs
+    hub_boxes = [b for b in (blue_bbox, red_bbox) if b is not None and len(b) >= 4]
+
+    for bbox in hub_boxes:
+        bx1, by1, bx2, by2 = bbox
+        rx1 = max(0, int(bx1 - 80))
+        ry1 = max(0, int(by1 - 140))
+        rx2 = min(w_img, int(bx2 + 80))
+        ry2 = min(h_img, int(by2 + 60))
+
+        if rx2 <= rx1 or ry2 <= ry1:
+            continue
+
+        roi = frame_bgr[ry1:ry2, rx1:rx2]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        # Liberal yellow chromaticity thresholds
+        # Hue: 13 to 44 (wider range), Saturation: >= 40, Value: >= 55
+        lower_y = np.array([13, 40, 55], dtype=np.uint8)
+        upper_y = np.array([44, 255, 255], dtype=np.uint8)
+        mask_hsv = cv2.inRange(hsv, lower_y, upper_y)
+
+        b_ch, g_ch, r_ch = cv2.split(roi)
+        # Relaxed RGB ratio: yellow has strong R and G relative to B
+        r_f = r_ch.astype(np.float32)
+        g_f = g_ch.astype(np.float32)
+        b_f = b_ch.astype(np.float32)
+        rgb_ratio = (r_f + g_f) / (2.0 * np.maximum(1.0, b_f))
+
+        mask_rgb = (r_ch >= 95) & (g_ch >= 95) & (b_ch <= 165) & (rgb_ratio >= 1.20)
+        combined_mask = mask_hsv & (mask_rgb.astype(np.uint8) * 255)
+
+        # Morphological noise removal (clean 3x3)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        clean_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            # Flying ball area in 1080p typically 4 to 900 px
+            if 4.0 <= area <= 900.0:
+                cw, ch = cv2.boundingRect(cnt)[2:]
+                aspect = max(cw, ch) / max(1, min(cw, ch))
+                # Allow streaked motion-blurred balls (aspect ratio up to 3.5)
+                if aspect <= 3.5:
+                    M = cv2.moments(cnt)
+                    if M["m00"] > 1e-5:
+                        cx = float(M["m10"] / M["m00"]) + rx1
+                        cy = float(M["m01"] / M["m00"]) + ry1
+                    else:
+                        x, y, w, h = cv2.boundingRect(cnt)
+                        cx = float(x + w / 2.0) + rx1
+                        cy = float(y + h / 2.0) + ry1
+                    flying_balls.append((cx, cy))
+
+    return flying_balls

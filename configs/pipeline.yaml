@@ -51,14 +51,23 @@ pipeline:
     mqtt_topic_root: "frc/2026/telemetry"
     max_payload_bytes: 51200 # 50 KB ceiling
   detection:
-    engine_path: "data/models/medium_robo_v3.pt"
-    confidence_threshold: 0.20
-    iou_threshold: 0.28
+    engine_path: "yolo11x_robot_best.pt"
+    bumper_model_path: "weights/bumper_best.pt"
+    bumper_confidence: 0.25
+    confidence_threshold: 0.25
+    iou_threshold: 0.45
     min_bumper_score: 0.10
     max_robots: 6
-    input_shape: [544, 1920]
-    field_roi_y: [0.12, 0.65]
-    field_bounds_screen: [0.02, 0.98, 0.13, 0.62]
+    input_shape: [1024, 1024]
+    field_roi_y: [0.08, 0.65]
+    field_bounds_screen: [0.02, 0.98, 0.08, 0.62]
+    enable_dual_tile: true
+    tile_left_x: [0, 1100]
+    tile_right_x: [820, 1920]
+    dynamic_conf_thresholds: [0.35, 0.20, 0.12, 0.06, 0.02]
+    target_robots_per_alliance: 3
+    track_coasting_max_frames: 45
+    alliance_decoupled_nms: true
   roster:
     red_teams: [1323, 4065, 4414]
     blue_teams: [868, 2046, 2910]
@@ -69,4 +78,16 @@ pipeline:
     max_radius_px: 30.0
     distance_match_threshold_px: 25.0
     max_coast_frames: 20
+  motion_segmentation:
+    enabled: true
+    method: "mog2"
+    history: 100
+    var_threshold: 25.0
+    detect_shadows: false
+    min_robot_area: 1000.0
+    max_ball_area: 1100.0
+    min_ball_area: 15.0
+    motion_decay: 0.96
+    static_energy_cutoff: 0.03
+
 
